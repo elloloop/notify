@@ -1,7 +1,7 @@
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
-github.com/elloloop/tenant-shard-db/sdk/go/entdb v1.32.1 h1:y8DK/wKYyxdQlVksAl4/Mgq+7EMP8lHj2oVJ41L8EJk=
-github.com/elloloop/tenant-shard-db/sdk/go/entdb v1.32.1/go.mod h1:JOqAF3IkX4K/xWfE01E+TRlBMFmjcDmrQh4NqVta+aE=
+github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2 v2.0.1 h1:XsCtfnHP9k49MXYu4EfEEadTV/n+4nO4UQJsLta0mOc=
+github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2 v2.0.1/go.mod h1:E+4KljYD3gt76gisxatnj6CGqy1Jgafia4Dl4v6nCKo=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
 github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=

@@ -23,8 +23,35 @@ import (
 	"context"
 	"strings"
 
-	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb"
+	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2"
+	"google.golang.org/protobuf/proto"
+
+	pb "github.com/elloloop/notify/gen/go/entdb_notify"
 )
+
+// SchemaMessages returns the proto-message witnesses for every node type
+// this driver writes. Pass them to sdk.WithSchema when constructing the
+// SDK client so the v2.0.1 server enforces the composite_key unique
+// constraint (ADR-031 self-describing writes):
+//
+//	client, err := sdk.NewClient(addr, sdk.WithSchema(entdb.SchemaMessages()...))
+//
+// The SDK reads only the descriptors — every (entdb.node) / (entdb.field)
+// option declared in proto/entdb_notify/notify.proto — and rides a NAME-FREE
+// SchemaDescriptor + fingerprint on the first ExecuteAtomic. Subsequent
+// writes omit the descriptor once the server confirms the matching
+// fingerprint. Re-registering the same schema on a reconnected client is
+// idempotent: the server resolves by fingerprint and the second register
+// is a no-op.
+//
+// Without WithSchema the server runs schemaless and the unique-index check
+// on composite_key is NOT enforced — the Concurrency/* canaries stay red.
+func SchemaMessages() []proto.Message {
+	return []proto.Message{
+		&pb.UserNotification{},
+		&pb.DeviceRegistration{},
+	}
+}
 
 // systemActor is used for cross-user lookups (composite-key idempotency
 // reads, device list queries spanning multiple device types). EntDB

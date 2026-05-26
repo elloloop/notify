@@ -39,25 +39,30 @@ const (
 // NotificationID) is unique; composite_key materializes it for sdk.GetByKey
 // because EntDB has no native composite-unique constraint.
 type UserNotification struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	NotificationId string                 `protobuf:"bytes,1,opt,name=notification_id,json=notificationId,proto3" json:"notification_id,omitempty"`
-	TenantId       string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
-	UserId         string                 `protobuf:"bytes,3,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
-	SubjectRef     string                 `protobuf:"bytes,4,opt,name=subject_ref,json=subjectRef,proto3" json:"subject_ref,omitempty"`
-	SubjectType    string                 `protobuf:"bytes,5,opt,name=subject_type,json=subjectType,proto3" json:"subject_type,omitempty"`
-	Title          string                 `protobuf:"bytes,6,opt,name=title,proto3" json:"title,omitempty"`
-	Body           string                 `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
-	Channel        string                 `protobuf:"bytes,8,opt,name=channel,proto3" json:"channel,omitempty"`
-	DeliveryStatus string                 `protobuf:"bytes,9,opt,name=delivery_status,json=deliveryStatus,proto3" json:"delivery_status,omitempty"`
-	CreatedAtMs    int64                  `protobuf:"varint,10,opt,name=created_at_ms,json=createdAtMs,proto3" json:"created_at_ms,omitempty"`
-	DeliveredAtMs  int64                  `protobuf:"varint,11,opt,name=delivered_at_ms,json=deliveredAtMs,proto3" json:"delivered_at_ms,omitempty"`
-	AckAtMs        int64                  `protobuf:"varint,12,opt,name=ack_at_ms,json=ackAtMs,proto3" json:"ack_at_ms,omitempty"`
-	ReadAtMs       int64                  `protobuf:"varint,13,opt,name=read_at_ms,json=readAtMs,proto3" json:"read_at_ms,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// String fields omit `kind:` and let the SDK derive `str` from the
+	// proto type — v2's server validates kinds against {str,int,float,bool,
+	// timestamp,json,bytes,enum,ref,list_*} and rejects the legacy `string`
+	// alias the v1.32.1 schemaless path silently accepted.
+	NotificationId string `protobuf:"bytes,1,opt,name=notification_id,json=notificationId,proto3" json:"notification_id,omitempty"`
+	TenantId       string `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	UserId         string `protobuf:"bytes,3,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	SubjectRef     string `protobuf:"bytes,4,opt,name=subject_ref,json=subjectRef,proto3" json:"subject_ref,omitempty"`
+	SubjectType    string `protobuf:"bytes,5,opt,name=subject_type,json=subjectType,proto3" json:"subject_type,omitempty"`
+	Title          string `protobuf:"bytes,6,opt,name=title,proto3" json:"title,omitempty"`
+	Body           string `protobuf:"bytes,7,opt,name=body,proto3" json:"body,omitempty"`
+	Channel        string `protobuf:"bytes,8,opt,name=channel,proto3" json:"channel,omitempty"`
+	DeliveryStatus string `protobuf:"bytes,9,opt,name=delivery_status,json=deliveryStatus,proto3" json:"delivery_status,omitempty"`
+	// int64 epoch-millis stored as `timestamp` (server-side kind) so the
+	// (kind != default) override is preserved.
+	CreatedAtMs   int64 `protobuf:"varint,10,opt,name=created_at_ms,json=createdAtMs,proto3" json:"created_at_ms,omitempty"`
+	DeliveredAtMs int64 `protobuf:"varint,11,opt,name=delivered_at_ms,json=deliveredAtMs,proto3" json:"delivered_at_ms,omitempty"`
+	AckAtMs       int64 `protobuf:"varint,12,opt,name=ack_at_ms,json=ackAtMs,proto3" json:"ack_at_ms,omitempty"`
+	ReadAtMs      int64 `protobuf:"varint,13,opt,name=read_at_ms,json=readAtMs,proto3" json:"read_at_ms,omitempty"`
 	// composite_key = "<tenant>|<user>|<notification_id>" — looked up via
-	// sdk.GetByKey for the idempotency guard. Marked unique so the SDK
-	// generates a UniqueKey token in the *_entdb.go output (when codegen is
-	// available; the driver currently constructs the key value by hand and
-	// hits the field via Query in its fallback path).
+	// sdk.GetByKey for the idempotency guard. v2's server enforces the
+	// `unique` annotation when the schema is registered, finally closing
+	// the composite-key race the v1.32.1 canaries reproduced.
 	CompositeKey  string `protobuf:"bytes,14,opt,name=composite_key,json=compositeKey,proto3" json:"composite_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -204,7 +209,7 @@ type DeviceRegistration struct {
 	CreatedAtMs  int64                  `protobuf:"varint,5,opt,name=created_at_ms,json=createdAtMs,proto3" json:"created_at_ms,omitempty"`
 	LastActiveMs int64                  `protobuf:"varint,6,opt,name=last_active_ms,json=lastActiveMs,proto3" json:"last_active_ms,omitempty"`
 	// composite_key = "<tenant>|<user>|<device_type>" — looked up via
-	// sdk.GetByKey for the upsert path.
+	// sdk.GetByKey for the upsert path; v2 server enforces unique.
 	CompositeKey  string `protobuf:"bytes,7,opt,name=composite_key,json=compositeKey,proto3" json:"composite_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -293,36 +298,36 @@ var File_entdb_notify_notify_proto protoreflect.FileDescriptor
 
 const file_entdb_notify_notify_proto_rawDesc = "" +
 	"\n" +
-	"\x19entdb_notify/notify.proto\x12\fentdb_notify\x1a\x19entdb/entdb_options.proto\"\xe9\x05\n" +
-	"\x10UserNotification\x129\n" +
-	"\x0fnotification_id\x18\x01 \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\x0enotificationId\x12-\n" +
-	"\ttenant_id\x18\x02 \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\btenantId\x12)\n" +
-	"\auser_id\x18\x03 \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\x06userId\x12-\n" +
-	"\vsubject_ref\x18\x04 \x01(\tB\f\xb2\xbb\x18\b:\x06stringR\n" +
-	"subjectRef\x12/\n" +
-	"\fsubject_type\x18\x05 \x01(\tB\f\xb2\xbb\x18\b:\x06stringR\vsubjectType\x12\"\n" +
-	"\x05title\x18\x06 \x01(\tB\f\xb2\xbb\x18\b:\x06stringR\x05title\x12 \n" +
-	"\x04body\x18\a \x01(\tB\f\xb2\xbb\x18\b:\x06stringR\x04body\x12&\n" +
-	"\achannel\x18\b \x01(\tB\f\xb2\xbb\x18\b:\x06stringR\achannel\x129\n" +
-	"\x0fdelivery_status\x18\t \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\x0edeliveryStatus\x125\n" +
+	"\x19entdb_notify/notify.proto\x12\fentdb_notify\x1a\x19entdb/entdb_options.proto\"\xfb\x04\n" +
+	"\x10UserNotification\x121\n" +
+	"\x0fnotification_id\x18\x01 \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\x0enotificationId\x12%\n" +
+	"\ttenant_id\x18\x02 \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\btenantId\x12!\n" +
+	"\auser_id\x18\x03 \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\x06userId\x12\x1f\n" +
+	"\vsubject_ref\x18\x04 \x01(\tR\n" +
+	"subjectRef\x12!\n" +
+	"\fsubject_type\x18\x05 \x01(\tR\vsubjectType\x12\x14\n" +
+	"\x05title\x18\x06 \x01(\tR\x05title\x12\x12\n" +
+	"\x04body\x18\a \x01(\tR\x04body\x12\x18\n" +
+	"\achannel\x18\b \x01(\tR\achannel\x121\n" +
+	"\x0fdelivery_status\x18\t \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\x0edeliveryStatus\x125\n" +
 	"\rcreated_at_ms\x18\n" +
 	" \x01(\x03B\x11\xb2\xbb\x18\r\x18\x01:\ttimestampR\vcreatedAtMs\x127\n" +
 	"\x0fdelivered_at_ms\x18\v \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\rdeliveredAtMs\x12+\n" +
 	"\tack_at_ms\x18\f \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\aackAtMs\x12-\n" +
 	"\n" +
-	"read_at_ms\x18\r \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\breadAtMs\x127\n" +
-	"\rcomposite_key\x18\x0e \x01(\tB\x12\xb2\xbb\x18\x0e\b\x01\x18\x01:\x06stringh\x01R\fcompositeKey:2\xa2\xbb\x18.\b\x01:\auser_idR!Per-user copy of one notification\"\xb7\x03\n" +
-	"\x12DeviceRegistration\x12-\n" +
-	"\ttenant_id\x18\x01 \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\btenantId\x12)\n" +
-	"\auser_id\x18\x02 \x01(\tB\x10\xb2\xbb\x18\f\b\x01\x18\x01:\x06stringR\x06userId\x12/\n" +
-	"\vdevice_type\x18\x03 \x01(\tB\x0e\xb2\xbb\x18\n" +
-	"\b\x01:\x06stringR\n" +
-	"deviceType\x12$\n" +
-	"\x05token\x18\x04 \x01(\tB\x0e\xb2\xbb\x18\n" +
-	"\b\x01:\x06stringR\x05token\x123\n" +
+	"read_at_ms\x18\r \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\breadAtMs\x12/\n" +
+	"\rcomposite_key\x18\x0e \x01(\tB\n" +
+	"\xb2\xbb\x18\x06\b\x01\x18\x01h\x01R\fcompositeKey:2\xa2\xbb\x18.\b\x01:\auser_idR!Per-user copy of one notification\"\x8f\x03\n" +
+	"\x12DeviceRegistration\x12%\n" +
+	"\ttenant_id\x18\x01 \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\btenantId\x12!\n" +
+	"\auser_id\x18\x02 \x01(\tB\b\xb2\xbb\x18\x04\b\x01\x18\x01R\x06userId\x12'\n" +
+	"\vdevice_type\x18\x03 \x01(\tB\x06\xb2\xbb\x18\x02\b\x01R\n" +
+	"deviceType\x12\x1c\n" +
+	"\x05token\x18\x04 \x01(\tB\x06\xb2\xbb\x18\x02\b\x01R\x05token\x123\n" +
 	"\rcreated_at_ms\x18\x05 \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\vcreatedAtMs\x125\n" +
-	"\x0elast_active_ms\x18\x06 \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\flastActiveMs\x127\n" +
-	"\rcomposite_key\x18\a \x01(\tB\x12\xb2\xbb\x18\x0e\b\x01\x18\x01:\x06stringh\x01R\fcompositeKey:K\xa2\xbb\x18G\b\x02:\auser_idR:A registered push endpoint for one user on one device typeB0Z.github.com/elloloop/notify/gen/go/entdb_notifyb\x06proto3"
+	"\x0elast_active_ms\x18\x06 \x01(\x03B\x0f\xb2\xbb\x18\v:\ttimestampR\flastActiveMs\x12/\n" +
+	"\rcomposite_key\x18\a \x01(\tB\n" +
+	"\xb2\xbb\x18\x06\b\x01\x18\x01h\x01R\fcompositeKey:K\xa2\xbb\x18G\b\x02:\auser_idR:A registered push endpoint for one user on one device typeB0Z.github.com/elloloop/notify/gen/go/entdb_notifyb\x06proto3"
 
 var (
 	file_entdb_notify_notify_proto_rawDescOnce sync.Once

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb"
+	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2"
 
 	"github.com/elloloop/notify"
 	"github.com/elloloop/notify/store/conformance"
@@ -39,7 +39,15 @@ func TestConformance(t *testing.T) {
 		t.Skip("NOTIFY_ENTDB_ADDRESS unset — skipping entdb conformance")
 	}
 
-	client, err := sdk.NewClient(addr)
+	// WithSchema enables ADR-031 self-describing writes against
+	// tenant-shard-db v2.0.1. The server materializes the notify schema
+	// from the NAME-FREE descriptor on the first ExecuteAtomic and then
+	// ENFORCES the composite_key unique constraint declared on each
+	// node type in proto/entdb_notify/notify.proto. Without this option
+	// the server runs schemaless and the two Concurrency canaries
+	// (ConcurrentCreate_SameKey_SingleWinner /
+	// ConcurrentUpsertDevice_SameKey_SingleRow) stay red.
+	client, err := sdk.NewClient(addr, sdk.WithSchema(entdbstore.SchemaMessages()...))
 	if err != nil {
 		t.Fatalf("sdk.NewClient: %v", err)
 	}
@@ -52,6 +60,35 @@ func TestConformance(t *testing.T) {
 
 	base := fmt.Sprintf("notify-conf-%d", time.Now().UnixNano())
 	var seq int64
+
+	// Schema-fingerprint warm-up: tenant-shard-db v2.0.1's SDK
+	// transport tracks the last server-confirmed schema fingerprint
+	// in an unsynchronized field (grpcTransport.serverFingerprint).
+	// The first ExecuteAtomic against a freshly-booted server takes
+	// the schema-attach branch and writes that field on the response
+	// path; concurrent goroutines all taking that branch trip Go's
+	// race detector (logical outcome is fine — the writes converge
+	// to the same value). Issuing a single serialized warm-up create
+	// here establishes the fingerprint before any concurrent subtest
+	// runs, so the racy field is touched exactly once. This is a
+	// workaround for an UPSTREAM SDK bug — see CONFORMANCE.md.
+	warmTenant := fmt.Sprintf("%s-warmup", base)
+	ensureTenant(t, client, warmTenant)
+	warmStore := entdbstore.New(client, warmTenant)
+	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if _, err := warmStore.CreateNotification(warmCtx, &notify.Notification{
+		NotificationID: "warmup",
+		TenantID:       warmTenant,
+		UserID:         "warmup-user",
+		Title:          "warmup",
+		Channel:        notify.ChannelInApp,
+		Status:         notify.StatusPending,
+		CreatedAtMS:    time.Now().UnixMilli(),
+	}); err != nil {
+		warmCancel()
+		t.Fatalf("schema-fingerprint warm-up create: %v", err)
+	}
+	warmCancel()
 
 	conformance.RunConformance(t, conformance.Driver{
 		Name: "entdb",

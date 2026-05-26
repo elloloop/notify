@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb"
+	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
@@ -162,7 +162,40 @@ func firstCreatedID(res *sdk.CommitResult) (string, error) {
 }
 
 // commitCreate runs Plan.Create + Commit and returns the new node id.
+// The post-commit `waitForNodeVisible` is the read-your-writes loop:
+// tenant-shard-db's WAL applier catches up asynchronously, so the next
+// read can miss the row we just wrote without an explicit wait.
+//
+// Concurrent same-key inserts: on tenant-shard-db v2.0.1 with a
+// registered schema, only one of N racing creates persists — the others
+// are rejected by the server-enforced unique constraint. But Plan.Commit
+// without `wait_applied` does NOT surface that rejection: the loser
+// gets a synthetic "success" response carrying its pre-allocated UUID,
+// then `waitForNodeVisible` times out polling for a node that was never
+// written. Callers that key writes by a unique field (e.g. composite_key)
+// should use [commitCreateUnique] instead — it resolves the canonical
+// row via the unique-key index and discriminates winner from loser by
+// comparing the returned id to the one the SDK pre-allocated. The Go
+// SDK does not expose `wait_applied` on Plan.Commit (Python does); when
+// upstream adds it this driver can collapse back to a single helper.
 func (c *Client) commitCreate(ctx context.Context, actor string, msg proto.Message) (string, error) {
+	id, err := c.commitCreateNoWait(ctx, actor, msg)
+	if err != nil {
+		return "", err
+	}
+	if err := c.waitForNodeVisible(ctx, actor, msg, id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// commitCreateNoWait runs Plan.Create + Commit without the post-commit
+// visibility poll. Returns the SDK-pre-allocated UUID — which is the
+// canonical row id ONLY if this caller won any racing unique-constraint
+// check on the server. Loser callers receive a UUID that never actually
+// landed on disk; they MUST resolve the canonical id via the unique-key
+// index ([commitCreateUnique] does that).
+func (c *Client) commitCreateNoWait(ctx context.Context, actor string, msg proto.Message) (string, error) {
 	scope, err := c.scope(actor)
 	if err != nil {
 		return "", err
@@ -173,17 +206,74 @@ func (c *Client) commitCreate(ctx context.Context, actor string, msg proto.Messa
 	if err != nil {
 		return "", err
 	}
-	id, err := firstCreatedID(res)
+	return firstCreatedID(res)
+}
+
+// commitCreateUnique is the create path for protos that carry a
+// unique-indexed field (composite_key on UserNotification /
+// DeviceRegistration). It submits the create, then resolves the
+// canonical row id via [sdk.GetByKey] with a bounded poll budget
+// because the WAL applier is asynchronous.
+//
+// The winner sees its SDK-pre-allocated id == the canonical id (the
+// server accepted the row). A loser sees them differ — the canonical
+// id is the winner's row, the pre-allocated id never persisted because
+// the v2 server's composite_key unique constraint rejected it. Both
+// callers end up with the canonical id; `won` discriminates them so
+// the loser can short-circuit follow-up writes (e.g. UpsertDevice's
+// token rotation must run against the canonical id, not the loser's
+// phantom id).
+func (c *Client) commitCreateUnique(
+	ctx context.Context,
+	actor string,
+	msg proto.Message,
+	key sdk.UniqueKey[string],
+	keyValue string,
+) (canonicalID string, won bool, err error) {
+	submittedID, err := c.commitCreateNoWait(ctx, actor, msg)
+	if err != nil {
+		return "", false, err
+	}
+	canonical, err := c.findByKeyWithRetry(ctx, actor, key, keyValue)
+	if err != nil {
+		return "", false, err
+	}
+	if canonical == "" {
+		return "", false, fmt.Errorf("entdb: row vanished after commit for key=%q", keyValue)
+	}
+	return canonical, canonical == submittedID, nil
+}
+
+// findByKeyWithRetry polls sdk.GetByKey until the unique-indexed row
+// becomes visible, with the same 5s ceiling [waitForNodeVisible] uses.
+// Returns "" with nil error when the deadline expires without finding
+// the row — that surfaces as the "row vanished" error from
+// [commitCreateUnique], the diagnostic signal for a server that lost
+// the write.
+func (c *Client) findByKeyWithRetry(ctx context.Context, actor string, key sdk.UniqueKey[string], keyValue string) (string, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	scope, err := c.scope(actor)
 	if err != nil {
 		return "", err
 	}
-	// Wait for read-your-writes: tenant-shard-db's WAL applier catches
-	// up asynchronously, so the next read can miss the row we just
-	// wrote without an explicit wait.
-	if err := c.waitForNodeVisible(ctx, actor, msg, id); err != nil {
-		return "", err
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		node, gerr := sdk.GetByKey(ctx, scope, key, keyValue)
+		if gerr == nil && node != nil {
+			return node.NodeID, nil
+		}
+		if gerr != nil && !isTenantNotOpened(gerr) {
+			return "", gerr
+		}
+		if time.Now().After(deadline) {
+			return "", nil
+		}
+		if serr := sleepOrCtx(ctx, 25*time.Millisecond); serr != nil {
+			return "", serr
+		}
 	}
-	return id, nil
 }
 
 // commitUpdate runs Plan.Update + Commit on an existing node id. The
