@@ -1,0 +1,80 @@
+// elloloop/notify — EntDB schema
+//
+// Node-type declarations for the EntDB-backed notify.Store driver. type_ids
+// are local to this service's tenant-shard-db instance: notify runs its own
+// EntDB deployment, no namespace collision with identity.
+//
+// Proto field numbers map to EntDB field_ids on disk — they are STABLE
+// and must never be renumbered. composite_key on every type is the unique
+// index the driver hits via sdk.GetByKey for idempotent (TenantID, UserID,
+// NotificationID) / (TenantID, UserID, DeviceType) lookups.
+
+syntax = "proto3";
+
+package entdb_notify;
+
+option go_package = "github.com/elloloop/notify/gen/go/entdb_notify";
+
+import "entdb/entdb_options.proto";
+
+// ─── UserNotification (type_id 1) ─────────────────────────────────────
+//
+// One row per (recipient, notification). The triple (TenantID, UserID,
+// NotificationID) is unique; composite_key materializes it for sdk.GetByKey
+// because EntDB has no native composite-unique constraint.
+message UserNotification {
+  option (entdb.node) = {
+    type_id: 1
+    data_policy: DATA_POLICY_PERSONAL
+    subject_field: "user_id"
+    description: "Per-user copy of one notification"
+  };
+
+  // String fields omit `kind:` and let the SDK derive `str` from the
+  // proto type — v2's server validates kinds against {str,int,float,bool,
+  // timestamp,json,bytes,enum,ref,list_*} and rejects the legacy `string`
+  // alias the v1.32.1 schemaless path silently accepted.
+  string notification_id  = 1  [(entdb.field) = { required: true, indexed: true }];
+  string tenant_id        = 2  [(entdb.field) = { required: true, indexed: true }];
+  string user_id          = 3  [(entdb.field) = { required: true, indexed: true }];
+  string subject_ref      = 4;
+  string subject_type     = 5;
+  string title            = 6;
+  string body             = 7;
+  string channel          = 8;
+  string delivery_status  = 9  [(entdb.field) = { required: true, indexed: true }];
+  // int64 epoch-millis stored as `timestamp` (server-side kind) so the
+  // (kind != default) override is preserved.
+  int64  created_at_ms    = 10 [(entdb.field) = { kind: "timestamp", indexed: true }];
+  int64  delivered_at_ms  = 11 [(entdb.field) = { kind: "timestamp" }];
+  int64  ack_at_ms        = 12 [(entdb.field) = { kind: "timestamp" }];
+  int64  read_at_ms       = 13 [(entdb.field) = { kind: "timestamp" }];
+  // composite_key = "<tenant>|<user>|<notification_id>" — looked up via
+  // sdk.GetByKey for the idempotency guard. v2's server enforces the
+  // `unique` annotation when the schema is registered, finally closing
+  // the composite-key race the v1.32.1 canaries reproduced.
+  string composite_key    = 14 [(entdb.field) = { required: true, indexed: true, unique: true }];
+}
+
+// ─── DeviceRegistration (type_id 2) ───────────────────────────────────
+//
+// One row per (recipient, device_type). The triple (TenantID, UserID,
+// DeviceType) is unique; composite_key materializes it for sdk.GetByKey.
+message DeviceRegistration {
+  option (entdb.node) = {
+    type_id: 2
+    data_policy: DATA_POLICY_PERSONAL
+    subject_field: "user_id"
+    description: "A registered push endpoint for one user on one device type"
+  };
+
+  string tenant_id      = 1 [(entdb.field) = { required: true, indexed: true }];
+  string user_id        = 2 [(entdb.field) = { required: true, indexed: true }];
+  string device_type    = 3 [(entdb.field) = { required: true }];
+  string token          = 4 [(entdb.field) = { required: true }];
+  int64  created_at_ms  = 5 [(entdb.field) = { kind: "timestamp" }];
+  int64  last_active_ms = 6 [(entdb.field) = { kind: "timestamp" }];
+  // composite_key = "<tenant>|<user>|<device_type>" — looked up via
+  // sdk.GetByKey for the upsert path; v2 server enforces unique.
+  string composite_key  = 7 [(entdb.field) = { required: true, indexed: true, unique: true }];
+}

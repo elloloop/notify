@@ -1,0 +1,107 @@
+// EntDB Schema Options - v2
+//
+// Import this in schema .proto files to annotate messages as EntDB node
+// types and edge types.
+
+syntax = "proto3";
+
+package entdb;
+
+import "google/protobuf/descriptor.proto";
+
+enum DataPolicy {
+  DATA_POLICY_PERSONAL = 0;
+  DATA_POLICY_BUSINESS = 1;
+  DATA_POLICY_FINANCIAL = 2;
+  DATA_POLICY_AUDIT = 3;
+  DATA_POLICY_EPHEMERAL = 4;
+  DATA_POLICY_HEALTHCARE = 5;
+}
+
+enum SubjectExitPolicy {
+  SUBJECT_EXIT_BOTH = 0;
+  SUBJECT_EXIT_FROM = 1;
+  SUBJECT_EXIT_TO = 2;
+}
+
+enum CoreCapability {
+  CORE_CAP_UNSPECIFIED = 0;
+  CORE_CAP_READ = 1;
+  CORE_CAP_COMMENT = 2;
+  CORE_CAP_EDIT = 3;
+  CORE_CAP_DELETE = 4;
+  CORE_CAP_ADMIN = 5;
+}
+
+message CapabilityMapping {
+  string op = 1;
+  string field = 2;
+  string field_value = 3;
+  string child_type = 4;
+  CoreCapability required_core = 5;
+  int32 required_ext = 6;
+}
+
+message CapabilityImplication {
+  CoreCapability core = 1;
+  int32 ext = 2;
+  repeated CoreCapability implies_core = 3;
+  repeated int32 implies_ext = 4;
+}
+
+message NodeOpts {
+  int32 type_id = 1;
+  bool public = 2;
+  bool tenant_visible = 3;
+  bool inherit = 4;
+  bool private = 5;
+  DataPolicy data_policy = 6;
+  string subject_field = 7;
+  int32 retention_days = 8;
+  string legal_basis = 9;
+  string description = 10;
+  bool deprecated = 11;
+  string extension_capability_enum = 20;
+  repeated CapabilityMapping capability_mappings = 21;
+  repeated CapabilityImplication capability_implications = 22;
+  reserved 23;
+  reserved "keys";
+}
+
+message EdgeOpts {
+  int32 edge_id = 1;
+  string name = 2;
+  bool propagate_share = 3;
+  bool unique_per_from = 4;
+  DataPolicy data_policy = 5;
+  SubjectExitPolicy on_subject_exit = 6;
+  int32 retention_days = 7;
+  string legal_basis = 8;
+  string description = 9;
+  bool deprecated = 10;
+}
+
+message FieldOpts {
+  bool required = 1;
+  bool searchable = 2;
+  bool indexed = 3;
+  bool pii = 4;
+  bool phi = 5;
+  string enum_values = 6;
+  string kind = 7;
+  int32 ref_type_id = 8;
+  string default_value = 9;
+  string description = 10;
+  bool deprecated = 11;
+  bool pii_false = 12;
+  bool unique = 13;
+}
+
+extend google.protobuf.MessageOptions {
+  NodeOpts node = 50100;
+  EdgeOpts edge = 50101;
+}
+
+extend google.protobuf.FieldOptions {
+  FieldOpts field = 50102;
+}
