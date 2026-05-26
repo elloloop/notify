@@ -14,34 +14,34 @@ import (
 	"github.com/elloloop/notify"
 )
 
+// notifKey and devKey use struct values (not concatenated strings) as map keys
+// so a NotificationID/DeviceType that contains a chosen separator byte cannot
+// collide with a different composition that hashes to the same flat string.
+// This keeps memory honest as the "correct" reference for the conformance
+// suite's KeyEdge probes.
+type notifKey struct{ Tenant, User, NotificationID string }
+type devKey struct{ Tenant, User, DeviceType string }
+
 // Store is a goroutine-safe in-memory notify.Store.
 type Store struct {
 	mu            sync.Mutex
-	notifications map[string]*notify.Notification // id → row
-	notifByKey    map[string]string               // tenant|user|notificationID → id
-	devices       map[string]*notify.Device       // id → device
-	deviceByKey   map[string]string               // tenant|user|deviceType → id
+	notifications map[string]*notify.Notification
+	notifByKey    map[notifKey]string
+	devices       map[string]*notify.Device
+	deviceByKey   map[devKey]string
 }
 
 // New returns an empty Store.
 func New() *Store {
 	return &Store{
 		notifications: make(map[string]*notify.Notification),
-		notifByKey:    make(map[string]string),
+		notifByKey:    make(map[notifKey]string),
 		devices:       make(map[string]*notify.Device),
-		deviceByKey:   make(map[string]string),
+		deviceByKey:   make(map[devKey]string),
 	}
 }
 
 var _ notify.Store = (*Store)(nil)
-
-func notifKey(tenantID, userID, notificationID string) string {
-	return tenantID + "|" + userID + "|" + notificationID
-}
-
-func deviceKey(tenantID, userID, deviceType string) string {
-	return tenantID + "|" + userID + "|" + deviceType
-}
 
 func cloneNotification(n *notify.Notification) *notify.Notification {
 	c := *n
@@ -54,11 +54,11 @@ func cloneDevice(d *notify.Device) *notify.Device {
 }
 
 // CreateNotification implements notify.Store.
-func (s *Store) CreateNotification(ctx context.Context, n *notify.Notification) (bool, error) {
+func (s *Store) CreateNotification(_ context.Context, n *notify.Notification) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := notifKey(n.TenantID, n.UserID, n.NotificationID)
+	key := notifKey{n.TenantID, n.UserID, n.NotificationID}
 	if existingID, ok := s.notifByKey[key]; ok {
 		n.ID = existingID
 		return false, nil
@@ -72,7 +72,7 @@ func (s *Store) CreateNotification(ctx context.Context, n *notify.Notification) 
 }
 
 // GetNotification implements notify.Store.
-func (s *Store) GetNotification(ctx context.Context, tenantID, userID, id string) (*notify.Notification, error) {
+func (s *Store) GetNotification(_ context.Context, tenantID, userID, id string) (*notify.Notification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -84,7 +84,7 @@ func (s *Store) GetNotification(ctx context.Context, tenantID, userID, id string
 }
 
 // UpdateStatus implements notify.Store.
-func (s *Store) UpdateStatus(ctx context.Context, tenantID, id string, status notify.DeliveryStatus, atMS int64) error {
+func (s *Store) UpdateStatus(_ context.Context, tenantID, id string, status notify.DeliveryStatus, atMS int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -105,7 +105,7 @@ func (s *Store) UpdateStatus(ctx context.Context, tenantID, id string, status no
 }
 
 // QueryUserNotifications implements notify.Store.
-func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*notify.Notification, string, int, error) {
+func (s *Store) QueryUserNotifications(_ context.Context, q notify.Query) ([]*notify.Notification, string, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -146,11 +146,11 @@ func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*
 }
 
 // UpsertDevice implements notify.Store.
-func (s *Store) UpsertDevice(ctx context.Context, d *notify.Device) (*notify.Device, error) {
+func (s *Store) UpsertDevice(_ context.Context, d *notify.Device) (*notify.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := deviceKey(d.TenantID, d.UserID, d.DeviceType)
+	key := devKey{d.TenantID, d.UserID, d.DeviceType}
 	if id, ok := s.deviceByKey[key]; ok {
 		existing := s.devices[id]
 		existing.Token = d.Token
@@ -166,7 +166,7 @@ func (s *Store) UpsertDevice(ctx context.Context, d *notify.Device) (*notify.Dev
 }
 
 // ListDevices implements notify.Store.
-func (s *Store) ListDevices(ctx context.Context, tenantID, userID string) ([]*notify.Device, error) {
+func (s *Store) ListDevices(_ context.Context, tenantID, userID string) ([]*notify.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

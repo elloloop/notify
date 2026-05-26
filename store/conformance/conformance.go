@@ -164,7 +164,7 @@ func RunConformance(t *testing.T, d Driver) {
 			}
 		})
 
-		t.Run("Pagination", func(t *testing.T) {
+		t.Run("CursorWalk_ThreePages", func(t *testing.T) {
 			ctx := context.Background()
 			s := d.New(t)
 			for i := 0; i < 5; i++ {
@@ -326,6 +326,16 @@ func RunConformance(t *testing.T, d Driver) {
 			}
 		})
 	})
+
+	// Extended categories — each opens its own t.Run(d.Name+"/<Category>")
+	// group so the test path immediately attributes a failure to the bug class
+	// that broke. memory passes every category and is the differential
+	// reference; entdb and postgres MUST match it.
+	runPaginationConformance(t, d)
+	runFreshTenantConformance(t, d)
+	runRoundTripConformance(t, d)
+	runConcurrencyConformance(t, d)
+	runKeyEdgeConformance(t, d)
 }
 
 func parseCursor(t *testing.T, cursor string) int64 {
