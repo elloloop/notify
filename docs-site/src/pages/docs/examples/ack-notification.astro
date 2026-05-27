@@ -1,0 +1,163 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Example — Ack a Notification">
+  <h1>Ack a Notification</h1>
+  <p>
+    Two distinct acknowledgements live on the client surface:
+    <code>AckNotification</code> marks a stored notification as
+    <code>Read</code>; <code>AckDataChange</code> cancels the
+    at-least-once retry of a data-change hint. Both are idempotent;
+    both surface as one Connect call.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <ul>
+    <li><strong><code>AckNotification</code></strong> — user opened the notification, viewed the inbox item, or otherwise consumed it. Decrements unread count, stamps <code>read_at_ms</code>.</li>
+    <li><strong><code>AckDataChange</code></strong> — the client successfully refetched the upstream state the hint pointed at; tells the server to stop retrying.</li>
+  </ul>
+
+  <h2>AckNotification — marking a row Read</h2>
+
+  <h3>The wire shape</h3>
+  <p>
+    The id field is the <em>store</em> id (the
+    <code>Notification.id</code> the server assigned), not the
+    producer's <code>notification_id</code>:
+  </p>
+  <Code code={`message AckNotificationRequest {
+  string id = 1;   // Notification.id (store id)
+}`} lang="proto" />
+
+  <h3>cURL</h3>
+  <Code code={`curl -sX POST http://notify:8080/elloloop.notify.v1.NotificationClientService/AckNotification \\
+  -H "Authorization: Bearer $JWT" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"id": "8b9f7c5e-4d3a-..."}'`} lang="bash" />
+
+  <h3>Connect-Web (TypeScript)</h3>
+  <Code code={`await client.ackNotification({ id: notification.id });`} lang="ts" />
+
+  <h3>Connect-Go</h3>
+  <Code code={`_, err := client.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{
+    Id: notification.GetId(),
+}))`} lang="go" />
+
+  <h3>Result</h3>
+  <p>
+    The store transitions the row to <code>StatusRead</code> and stamps
+    <code>read_at_ms</code> to the server clock. A follow-up
+    <code>GetNotifications</code> shows the new status and an
+    <code>unread_count</code> reduced by one.
+  </p>
+
+  <Code code={`// before
+{ "id": "8b9f...", "status": "DELIVERY_STATUS_DELIVERED", "readAtMs": "0",  "unreadCount": 3 }
+
+// after AckNotification
+{ "id": "8b9f...", "status": "DELIVERY_STATUS_READ",      "readAtMs": "1748391033", "unreadCount": 2 }`} lang="json" />
+
+  <h2>Authorization story</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    <code>Store.UpdateStatus</code> takes <code>tenantID</code> and
+    <code>id</code> only — not <code>userID</code>. Without an
+    ownership check, any user in tenant T could mark any other user's
+    notification as Read by guessing the id. The handler does an
+    explicit <code>GetNotification(claims.TenantID, claims.UserID,
+    id)</code> first and maps a miss to <code>CodeNotFound</code> —
+    never <code>CodePermissionDenied</code>, which would leak the
+    existence of someone else's row.
+  </blockquote>
+
+  <h2>Idempotency</h2>
+  <p>
+    Calling <code>AckNotification</code> on an already-read row is a
+    no-op that returns success. The store update is a status-set, not a
+    counter increment; multiple calls do not multiply the effect.
+  </p>
+
+  <h2>AckDataChange — cancelling a retry</h2>
+
+  <h3>The wire shape</h3>
+  <Code code={`message AckDataChangeRequest {
+  string idempotency_key = 1;   // from DataChangeEvent.idempotencyKey
+  string session_id      = 2;   // from StreamEvent.sessionId
+}`} lang="proto" />
+
+  <h3>Connect-Web</h3>
+  <Code code={`for await (const ev of client.streamEvents({ deviceType: "DEVICE_TYPE_BROWSER" })) {
+  const sessionId = ev.sessionId;
+
+  if (ev.event.case === "dataChange") {
+    const dc = ev.event.value;
+
+    // Refetch the upstream state the hint pointed at.
+    await refetchUpstream(dc.subjectRef);
+
+    // Tell the server to stop retrying this hint.
+    await client.ackDataChange({
+      idempotencyKey: dc.idempotencyKey,
+      sessionId,
+    });
+  }
+}`} lang="ts" />
+
+  <h3>Connect-Go</h3>
+  <Code code={`_, err := client.AckDataChange(ctx, connect.NewRequest(&notifyv1.AckDataChangeRequest{
+    IdempotencyKey: event.GetIdempotencyKey(),
+    SessionId:      event.GetSessionId(),
+}))`} lang="go" />
+
+  <h3>What it actually does</h3>
+  <p>
+    The handler calls <code>RetryTracker.Ack(key, sessionID)</code> on
+    the server's in-memory tracker. The matching retry goroutine
+    receives a context cancel; the entry is removed from the map. If
+    the (key, sessionID) pair is not registered (already acked,
+    process restart, etc.), the call is a no-op and still returns
+    success.
+  </p>
+
+  <h2>Live connections disabled?</h2>
+  <p>
+    When <code>NOTIFY_LIVE_CONNECTIONS_ENABLED=false</code>, there is no
+    retry tracker and no live stream. <code>AckDataChange</code> returns
+    success without doing anything — clients calling it speculatively
+    do not need to gate on the subsystem state.
+  </p>
+
+  <h2>Wiring it into a UI</h2>
+  <Code code={`// React example — mark a notification read when the user clicks it.
+function NotificationRow({ n, onAcked }: { n: Notification; onAcked: () => void }) {
+  return (
+    <li
+      onClick={async () => {
+        await client.ackNotification({ id: n.id });
+        onAcked();
+      }}
+      className={n.status === "DELIVERY_STATUS_READ" ? "muted" : "unread"}
+    >
+      <strong>{n.title}</strong>
+      <p>{n.body}</p>
+    </li>
+  );
+}`} lang="tsx" />
+
+  <h2>Mark-all-read</h2>
+  <p>
+    v0.1 ships no bulk-ack RPC. The recommended client-side shape is to
+    page the inbox with <code>unreadOnly: true</code> and ack each row.
+    A native <code>MarkAllRead</code> RPC is a candidate follow-up; if
+    you need it before then, file an issue on the repo.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/api-reference/grpc#notificationclientservice">API Reference</a></li>
+    <li><a href="/notify/docs/examples/subscribe-sse">Subscribe over SSE</a></li>
+    <li><a href="/notify/docs/concepts/realtime-engine">Realtime engine</a> — RetryTracker invariants</li>
+  </ul>
+</DocsLayout>

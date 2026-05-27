@@ -1,0 +1,173 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Deployment — Docker">
+  <h1>Deployment — Docker</h1>
+  <p>
+    Production-shape Docker deployment of notify. For the "what is the
+    image" overview see <a href="/notify/docs/installation/docker">Installation
+    → Docker</a>; this page covers networking, secrets, healthchecks,
+    multi-arch, and a worked <code>docker-compose</code> stack.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <ul>
+    <li>You operate Docker hosts directly (no Kubernetes).</li>
+    <li>Your local dev / staging stack lives in <code>docker-compose</code>.</li>
+    <li>You want to verify a release tag with a smoke run before promoting it.</li>
+  </ul>
+
+  <h2>Multi-arch image</h2>
+  <p>
+    The published image is built for <code>linux/amd64</code> and
+    <code>linux/arm64</code>. Docker pulls the right variant
+    automatically. To verify:
+  </p>
+  <Code code={`docker buildx imagetools inspect ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <h2>Image verification</h2>
+  <p>
+    Every published tag is signed via cosign keyless OIDC. Verify before
+    deploying:
+  </p>
+  <Code code={`cosign verify ghcr.io/elloloop/notify:0.1.0 \\
+  --certificate-identity-regexp 'https://github\\.com/elloloop/notify/' \\
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com`} lang="bash" />
+
+  <h2>Production docker-compose</h2>
+  <Code code={`services:
+  notify:
+    image: ghcr.io/elloloop/notify:0.1.0
+    restart: unless-stopped
+    networks:
+      - public        # client port exposed via the reverse proxy
+      - internal      # internal port only reachable from the cluster
+      - data          # store + provider sidecars
+    ports:
+      - "8080:8080"   # remove if running behind a TLS-terminating proxy
+    expose:
+      - "8081"        # internal-only, not published
+      - "9090"        # /metrics, scraped by the Prometheus sidecar
+    environment:
+      NOTIFY_STORE_DRIVER: postgres
+      NOTIFY_POSTGRES_DSN: postgres://notify:\${POSTGRES_PASSWORD}@db:5432/notify?sslmode=require
+      NOTIFY_POSTGRES_AUTOMIGRATE: "true"
+      NOTIFY_AUTH_JWT_SECRET: \${NOTIFY_AUTH_JWT_SECRET}
+      NOTIFY_INTERNAL_TOKEN: \${NOTIFY_INTERNAL_TOKEN}
+      NOTIFY_AUTH_JWT_ISSUER: https://identity.example.com
+      NOTIFY_ALLOWED_ORIGINS: https://app.example.com
+      NOTIFY_LOG_LEVEL: info
+      # Email via the elloloop EmailService container.
+      NOTIFY_EMAIL_PROVIDER: emailservice
+      NOTIFY_EMAIL_SERVICE_ADDRESS: emailservice:50053
+      NOTIFY_EMAIL_FROM: noreply@example.com
+      # SMS via Twilio.
+      NOTIFY_SMS_PROVIDER: twilio
+      NOTIFY_SMS_ACCOUNT_SID: \${TWILIO_ACCOUNT_SID}
+      NOTIFY_SMS_AUTH_TOKEN: \${TWILIO_AUTH_TOKEN}
+      NOTIFY_SMS_FROM: "+15555550000"
+    healthcheck:
+      # No shell in the FROM scratch image, so probe from a separate
+      # tool (an alpine sidecar, or the reverse proxy's health checks).
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  db:
+    image: postgres:16.13-alpine3.23
+    restart: unless-stopped
+    networks: [data]
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_DB: notify
+    volumes:
+      - notify_pgdata:/var/lib/postgresql/data
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    networks: [internal]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+networks:
+  public:
+  internal:
+  data:
+
+volumes:
+  notify_pgdata:`} lang="yaml" title="compose.yaml" />
+
+  <h2>Secrets management</h2>
+  <p>
+    Compose's <code>.env</code> file is fine for dev. Production:
+  </p>
+  <ul>
+    <li>Project secrets from your secret manager (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, GCP Secret Manager) and inject as env vars at launch.</li>
+    <li>Avoid baking secrets into images.</li>
+    <li>Rotate JWT secrets per <a href="/notify/docs/installation/jwt-keys#rotation">the rotation procedure</a>.</li>
+  </ul>
+
+  <h2>Reverse-proxy / TLS termination</h2>
+  <p>
+    notify speaks plaintext HTTP/2 (h2c) inside the container — terminate
+    TLS upstream. Typical shapes:
+  </p>
+  <ul>
+    <li><strong>Caddy</strong> — automatic Let's Encrypt, transparent h2c proxy. One-liner site block: <code>app.example.com {`{`} reverse_proxy notify:8080 {`}`}</code>.</li>
+    <li><strong>nginx</strong> — explicit <code>grpc_pass</code> for the internal port; <code>proxy_pass</code> for the client port (Connect over HTTP/1 works fine).</li>
+    <li><strong>Traefik</strong> — annotate the docker service for auto-discovery.</li>
+    <li><strong>Cloudflare</strong> — front the client port at the edge, lock the origin to Cloudflare's IP ranges.</li>
+  </ul>
+
+  <h2>Smoke-test a release tag</h2>
+  <Code code={`# Boot, hit /healthz, kill.
+docker run -d --name notify-smoke \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  -p 18080:8080 -p 18081:8081 -p 19090:9090 \\
+  ghcr.io/elloloop/notify:0.1.0
+
+# Wait for the listener.
+for i in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:19090/healthz > /tmp/h.json; then
+    cat /tmp/h.json
+    break
+  fi
+  sleep 1
+done
+
+docker rm -f notify-smoke`} lang="bash" />
+
+  <p>
+    The same smoke is what <code>.github/workflows/release.yml</code>
+    runs against every published image before tagging it for promotion.
+  </p>
+
+  <h2>Resource sizing</h2>
+  <p>
+    notify's hot path is small: one <code>Notifier.Notify</code> is one
+    store insert plus one provider call per channel. The realtime
+    engine is in-memory and a per-conn buffered channel. Reasonable
+    starting points:
+  </p>
+  <ul>
+    <li><strong>CPU</strong>: 0.5 vCPU is enough for moderate traffic; the upper bound is dominated by provider call latency.</li>
+    <li><strong>Memory</strong>: 64 MiB baseline; budget ~5 KiB per active stream connection.</li>
+    <li><strong>Network</strong>: long-lived streams open a TCP connection per recipient — size your ephemeral port range accordingly if you expect 10k+ concurrent clients.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/docker">Installation: Docker</a></li>
+    <li><a href="/notify/docs/deployment/kubernetes">Deployment: Kubernetes</a></li>
+    <li><a href="/notify/docs/operations/observability">Observability</a></li>
+    <li><a href="/notify/docs/operations/shutdown">Graceful shutdown</a></li>
+  </ul>
+</DocsLayout>

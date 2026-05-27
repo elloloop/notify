@@ -1,0 +1,152 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="JWT Keys">
+  <h1>JWT Keys</h1>
+  <p>
+    notify validates client-facing requests with an HS256 JWT signature.
+    The verification key is a shared secret you generate, hand to the JWT
+    issuer (identity), and hand to notify via
+    <code>NOTIFY_AUTH_JWT_SECRET</code>.
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    You are setting up a production deployment, rotating a leaked secret,
+    or wiring an existing identity-issued JWT into notify.
+  </p>
+
+  <h2>Generating the secret</h2>
+  <p>
+    Use a CSPRNG. Anything 32 bytes or larger is fine for HS256 (256 bits
+    of entropy matches the HMAC-SHA-256 output size).
+  </p>
+  <Code code={`# 32 random bytes as a hex string (64 hex chars)
+openssl rand -hex 32
+# → 4f7b9b1c8e0a8e3a... (sample)
+
+# Or via /dev/urandom
+head -c 32 /dev/urandom | xxd -p -c 64`} lang="bash" />
+
+  <h2>Pass it to notify</h2>
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_AUTH_JWT_SECRET=$(openssl rand -hex 32) \\
+  -e NOTIFY_INTERNAL_TOKEN=$(openssl rand -hex 32) \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <p>
+    In production prefer a secrets manager (Kubernetes Secret, AWS
+    Secrets Manager, Azure Key Vault) and project the value into the
+    container as an env var.
+  </p>
+
+  <h2>Pinning issuer and audience</h2>
+  <p>
+    When the JWT issuer is identity, set the matching expected claims
+    so notify rejects tokens minted by anyone else:
+  </p>
+  <Code code={`-e NOTIFY_AUTH_JWT_ISSUER=https://identity.example.com \\
+-e NOTIFY_AUTH_JWT_AUDIENCE=notify`} lang="bash" />
+
+  <p>
+    If your identity tenant uses different values, copy them verbatim
+    from the issuer config. A missing or mismatched claim returns
+    <code>CodeUnauthenticated</code>.
+  </p>
+
+  <h2>Token shape</h2>
+  <p>
+    notify expects the standard claims plus a tenant claim:
+  </p>
+  <Code code={`{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+.
+{
+  "sub": "user-alice",
+  "tenant": "acme",
+  "email": "alice@example.com",
+  "iss": "https://identity.example.com",
+  "aud": "notify",
+  "exp": 1748390400,
+  "iat": 1748386800
+}`} lang="json" title="decoded JWT" />
+
+  <p>
+    <code>sub</code> populates <code>Claims.UserID</code>;
+    <code>tenant</code> (or the alternative <code>tenant_id</code>)
+    populates <code>Claims.TenantID</code>; <code>email</code> is
+    optional and surfaces in observability.
+  </p>
+
+  <h2>Minting a test token</h2>
+  <p>
+    Tiny one-off generator in Python — useful for manual cURLs against a
+    locally-deployed notify with a real JWT secret:
+  </p>
+  <Code code={`# requires: pip install pyjwt
+import time, jwt
+
+SECRET = "your-shared-hex-secret"
+token = jwt.encode(
+    {
+        "sub": "user-alice",
+        "tenant": "acme",
+        "email": "alice@example.com",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 900,
+    },
+    SECRET,
+    algorithm="HS256",
+)
+print(token)`} lang="python" />
+
+  <Code code={`# requires: go install github.com/golang-jwt/jwt/v5/cmd/jwt@latest  (or hand-roll)
+jwt encode --secret "your-shared-hex-secret" --alg HS256 \\
+  '{"sub":"user-alice","tenant":"acme","exp":1748390400,"iat":1748386800}'`} lang="bash" />
+
+  <h2>Rotation</h2>
+  <p>
+    notify v0.1 validates against a single secret — there is no key ring
+    on the verifier. To rotate without a flap, the standard procedure is:
+  </p>
+  <ol>
+    <li>Issue a new secret <code>S2</code>.</li>
+    <li>Configure the JWT issuer (identity) to <em>dual-issue</em>: every new token signed with <code>S2</code>, every legacy token still signed with <code>S1</code> tracked by <code>kid</code>.</li>
+    <li>Run two notify replicas in parallel: one with <code>NOTIFY_AUTH_JWT_SECRET=S1</code>, one with <code>NOTIFY_AUTH_JWT_SECRET=S2</code>. Route traffic by inspecting the <code>kid</code> in the JWT header at the gateway.</li>
+    <li>After all <code>S1</code>-signed tokens have expired (one access-token TTL window), retire the <code>S1</code> replica and the issuer's <code>S1</code> signing key.</li>
+  </ol>
+  <p>
+    The simpler alternative — rolling everyone out, swapping the secret,
+    rolling back in — is acceptable for short outage windows but is what
+    rotation is supposed to avoid. A future wave will add a multi-key
+    verifier so notify can hold both keys natively.
+  </p>
+
+  <h2>What if my JWT is RS256?</h2>
+  <p>
+    v0.1 only validates HS256. If your identity provider signs RS256
+    (e.g. you are using the
+    <a href="https://github.com/elloloop/identity">identity</a> service's
+    JWKS surface), the recommended shape today is:
+  </p>
+  <ul>
+    <li>Run a thin reverse proxy / gateway in front of notify that verifies the RS256 token against JWKS, then re-mints an HS256 token for notify's downstream consumption.</li>
+    <li>Or run notify in library mode with your own validator wired in via <code>server.Dependencies.AuthValidator</code>.</li>
+  </ul>
+  <p>
+    Native RS256 + JWKS verification is on the roadmap; track
+    <a href="https://github.com/elloloop/notify/issues">notify issues</a>.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/auth-model">Auth Model</a> — the full validation flow</li>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a> — every <code>NOTIFY_AUTH_*</code> var</li>
+  </ul>
+</DocsLayout>

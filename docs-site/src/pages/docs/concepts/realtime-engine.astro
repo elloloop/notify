@@ -1,0 +1,131 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Realtime Engine">
+  <h1>Realtime Engine</h1>
+  <p>
+    The <code>realtime</code> package is the in-memory engine that powers
+    in-app delivery: a per-user connection registry, a buffered per-conn
+    channel, and an at-least-once retry tracker. It is generic over the
+    event payload (<code>Registry[T any]</code>), so it has zero
+    dependency on the notify proto or any transport — the server
+    instantiates <code>Registry[*pb.StreamEvent]</code> at boot.
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    You only need to know this exists if you are:
+  </p>
+  <ul>
+    <li>Operating the container and turning the live-connections subsystem on or off (<code>NOTIFY_LIVE_CONNECTIONS_ENABLED</code>).</li>
+    <li>Building a custom client and wondering why a backed-up consumer doesn't block the producer.</li>
+    <li>Implementing a different transport (raw SSE, WebSocket) on top of the library.</li>
+    <li>Reading the codebase and trying to understand where state goes.</li>
+  </ul>
+
+  <h2>The three types</h2>
+  <Code code={`// One live client connection. EventCh is buffered (default 64) and
+// NEVER closed: closing would race concurrent non-blocking senders;
+// once unregistered + handler returns, the channel is unreachable and
+// reclaimed by the GC.
+type Conn[T any] struct {
+    ID         string
+    UserID     string
+    TenantID   string
+    DeviceType string
+    EventCh    chan T
+    CreatedAt  time.Time
+}
+
+// Per-user index of live connections. Lock-free reads via RLock; writes
+// take the full lock. Push does non-blocking sends — a full buffer is
+// logged and the event dropped, but the connection stays registered.
+type Registry[T any] struct{ /* … */ }
+
+// At-least-once retry budget. Track(parent, key, []connID, callback)
+// runs the callback on a fixed interval per (key, connID) until
+// either Ack is called or attempt budget is exhausted.
+type RetryTracker struct{ /* … */ }`} lang="go" />
+
+  <h2>What hangs off it</h2>
+  <p>
+    The server constructs <strong>one</strong> Registry shared by every
+    connection, and <strong>one</strong> RetryTracker shared by every
+    in-flight retry. <code>StreamEvents</code> creates a fresh
+    <code>Conn</code> on each open, registers it, and tears it down on
+    exit. The in-app provider's <code>Send</code> looks up live
+    connections for the target user via <code>Registry.Push</code> and
+    returns <code>StatusDelivered</code> if any accepted the event,
+    <code>StatusPending</code> if none did.
+  </p>
+
+  <h2>Non-blocking by design</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    A stalled client must never block the producer. Every <code>Push</code>
+    is a non-blocking <code>{`select { case ch <- ev: ... default: ... }`}</code>;
+    a connection whose buffer is full has the event dropped (logged via
+    <code>event_queue_full</code>) but stays registered for future
+    events. The alternative — backing up the orchestrator behind one slow
+    client — would let one misbehaving recipient stall delivery for
+    everyone else on the same notifier.
+  </blockquote>
+
+  <h2>EventCh is buffered AND never closed</h2>
+  <p>
+    This is a subtle invariant documented inline in
+    <code>realtime/conn.go</code>:
+  </p>
+  <ul>
+    <li><strong>Buffered</strong> — so non-blocking sends have somewhere to go and producers don't stall.</li>
+    <li><strong>Never closed</strong> — because closing a channel that goroutines are racing to send on panics. The lifecycle ends by unregistering the Conn and letting the handler return; the GC reclaims the channel.</li>
+  </ul>
+
+  <h2>RetryTracker: at-least-once for data-change events</h2>
+  <p>
+    Data-change hints (<code>DataChangeEvent</code>) are best-effort hints
+    that <em>something the client cares about may have changed upstream</em>.
+    The client re-fetches its own state via its own API. For these
+    hints, the platform offers at-least-once via the
+    <code>RetryTracker</code>:
+  </p>
+  <ol>
+    <li>Server emits a <code>DataChangeEvent</code> with an <code>idempotency_key</code>.</li>
+    <li><code>RetryTracker.Track(ctx, key, []connID, sendCallback)</code> spawns a goroutine per (key, connID) that re-sends on <code>NOTIFY_LIVE_RETRY_INTERVAL</code> ticks.</li>
+    <li>Client acks via <code>{`AckDataChange{idempotency_key, session_id}`}</code>.</li>
+    <li>The tracker cancels the retry goroutine.</li>
+  </ol>
+
+  <p>
+    Budget is bounded: <code>NOTIFY_LIVE_RETRY_MAX_ATTEMPTS</code> (default
+    3) caps retries; a value of 0 disables retries entirely. On shutdown
+    <code>CancelAll</code> closes every in-flight retry so they don't
+    leak.
+  </p>
+
+  <h2>Turning the subsystem off</h2>
+  <p>
+    Set <code>NOTIFY_LIVE_CONNECTIONS_ENABLED=false</code>. The container
+    never constructs a Registry, the in-app provider is not registered,
+    and <code>StreamEvents</code> returns
+    <code>CodeUnimplemented</code>. In-app notifications remain
+    <code>StatusPending</code>; clients catch up via
+    <code>GetNotifications</code>.
+  </p>
+
+  <p>
+    This is a legitimate deployment shape when you only care about the
+    durable side of the platform — e.g. a backend running notify in
+    library mode purely for stored notification fanout, with the live
+    surface served by a separate gateway.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/in-app">In-App channel</a> — the wire view</li>
+    <li><a href="/notify/docs/examples/subscribe-sse">Subscribe over SSE</a> — full client flow</li>
+    <li><a href="/notify/docs/operations/shutdown">Graceful shutdown</a> — retry-tracker drain</li>
+  </ul>
+</DocsLayout>

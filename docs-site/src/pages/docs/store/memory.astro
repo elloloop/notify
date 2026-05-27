@@ -1,0 +1,92 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Memory store">
+  <h1>Memory store</h1>
+  <p>
+    The memory driver is the in-process reference implementation. All
+    state lives in Go maps protected by a mutex; restart loses
+    everything. It is the differential reference for the conformance
+    suite — every other driver is verified against memory's exact
+    behaviour.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <ul>
+    <li><strong>Tests &amp; CI</strong> — your unit tests that exercise notify's contract via a fake store.</li>
+    <li><strong>Local development / demos</strong> — no DB to provision; restart the container to clear state.</li>
+    <li><strong>Ephemeral environments</strong> — preview deployments that don't need durability.</li>
+  </ul>
+
+  <h2>Selecting it</h2>
+  <p>It is the default. No env vars required.</p>
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  ghcr.io/elloloop/notify:latest`} lang="bash" />
+
+  <p>Or explicitly:</p>
+  <Code code={`-e NOTIFY_STORE_DRIVER=memory`} lang="bash" />
+
+  <h2>Library wiring</h2>
+  <Code code={`import (
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/store/memory"
+)
+
+store := memory.New()
+notifier := notify.NewNotifier(store, providers)`} lang="go" />
+
+  <h2>Characteristics</h2>
+  <ul>
+    <li><strong>Thread-safe</strong> — a single <code>sync.RWMutex</code> guards two maps.</li>
+    <li><strong>Idempotent on (tenant, user, notification_id)</strong> — repeat creates return the existing id with <code>created=false</code>.</li>
+    <li><strong>O(n) page scans</strong> — adequate for the test workloads; not optimised for very large inboxes (which is why Postgres exists).</li>
+    <li><strong>No background work</strong> — no timers, no goroutines beyond what the caller drives.</li>
+  </ul>
+
+  <h2>Running the conformance suite locally</h2>
+  <Code code={`go test ./store/memory/... -race -count=1 -v`} lang="bash" />
+
+  <p>
+    All 24 leaf subtests across the six categories pass. memory is the
+    fastest of the three (no testcontainer warm-up, no EntDB SDK
+    handshake) and is the gate that catches a botched conformance
+    refactor before the slower drivers run.
+  </p>
+
+  <h2>Using it as the reference in your own tests</h2>
+  <p>
+    If you are writing tests that exercise notify's behaviour from your
+    consumer's POV — without spinning up Postgres or EntDB — wire
+    memory directly:
+  </p>
+  <Code code={`func TestMyService_SendsNotification(t *testing.T) {
+    store := memory.New()
+    providers := notify.NewProviderRegistry()
+    providers.Register(&fakeEmailProvider{})
+
+    notifier := notify.NewNotifier(store, providers, notify.WithClock(func() time.Time {
+        return time.Unix(1748390400, 0)
+    }))
+
+    myService := NewMyService(notifier)
+    myService.DoTheThing(ctx, "user-alice")
+
+    items, _, _, _ := store.QueryUserNotifications(ctx, notify.Query{
+        TenantID: "acme", UserID: "user-alice",
+    })
+    if len(items) != 1 {
+        t.Fatalf("expected one stored row, got %d", len(items))
+    }
+}`} lang="go" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a></li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a></li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a></li>
+  </ul>
+</DocsLayout>

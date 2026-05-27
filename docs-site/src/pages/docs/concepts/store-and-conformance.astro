@@ -1,0 +1,121 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Store & Conformance">
+  <h1>Store &amp; Conformance</h1>
+  <p>
+    notify treats persistence as a pluggable concern. There is one
+    <code>Store</code> interface, three shipped drivers
+    (<code>memory</code>, <code>postgres</code>, <code>entdb</code>), and a
+    shared conformance suite that every driver runs. Adding a new driver
+    is a matter of implementing the interface and passing the suite.
+  </p>
+
+  <h2>When to use what</h2>
+  <ul>
+    <li><strong>memory</strong> — tests, demos, ephemeral dev environments. The differential reference for "what does the contract mean".</li>
+    <li><strong>postgres</strong> — production deployments using a managed Postgres (RDS, Azure Database for PostgreSQL, Cloud SQL). Most production deployments will start here.</li>
+    <li><strong>entdb</strong> — tenant-shard-db deployments. Pick this when you already run EntDB for other services and want notify to share its operational story.</li>
+  </ul>
+
+  <h2>The Store interface</h2>
+  <Code code={`type Store interface {
+    // Idempotent on (TenantID, UserID, NotificationID). Re-creates set
+    // n.ID to the existing id and return created=false.
+    CreateNotification(ctx context.Context, n *Notification) (created bool, err error)
+
+    // Tenant + user scoped. Returns ErrNotFound for unknown ids or
+    // cross-tenant / cross-user attempts (privacy: never leak existence).
+    GetNotification(ctx context.Context, tenantID, userID, id string) (*Notification, error)
+
+    // Sets the delivery status and stamps the matching timestamp field
+    // (delivered→DeliveredAtMS, acked→AckAtMS, read→ReadAtMS).
+    UpdateStatus(ctx context.Context, tenantID, id string, status DeliveryStatus, atMS int64) error
+
+    // Returns one page newest-first. unreadCount is total-not-yet-read,
+    // independent of the page window and any UnreadOnly filter.
+    QueryUserNotifications(ctx context.Context, q Query) (items []*Notification, nextCursor string, unreadCount int, err error)
+
+    // Keyed on (TenantID, UserID, DeviceType). Rotates token in place.
+    UpsertDevice(ctx context.Context, d *Device) (*Device, error)
+
+    // Ordered by device_type for deterministic output.
+    ListDevices(ctx context.Context, tenantID, userID string) ([]*Device, error)
+}`} lang="go" />
+
+  <p>Two sentinel errors round out the contract:</p>
+  <Code code={`var (
+    ErrNotFound = errors.New("notify: not found")
+    ErrConflict = errors.New("notify: conflict")
+)`} lang="go" />
+
+  <h2>Why the contract is this small</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    The realtime registry, the retry tracker, and per-user channel
+    preferences (future) all live <em>outside</em> the Store. The Store
+    holds only what is durable and shared across replicas: notification
+    rows and device registrations. Keeping the interface tight makes new
+    drivers cheap, makes the conformance suite tractable, and prevents
+    "the store" from becoming a leaky god-object.
+  </blockquote>
+
+  <h2>The conformance suite</h2>
+  <p>
+    <code>store/conformance.RunConformance</code> exercises every driver
+    against the same 24 leaf subtests across six categories. A failure
+    path like <code>TestConformance/postgres/Concurrency/ConcurrentCreate_SameKey_SingleWinner</code>
+    points straight at the driver and the exact semantic that broke.
+  </p>
+  <table>
+    <tr><th>Category</th><th>Subtests</th><th>What it catches</th></tr>
+    <tr><td>Core CRUD</td><td>8</td><td>create / get / idempotency / status transitions / paging basics / unread filter / device upsert / user isolation</td></tr>
+    <tr><td>Pagination</td><td>2</td><td>full-set traversal across many pages, strict-less-than cursor semantics</td></tr>
+    <tr><td>FreshTenant</td><td>3</td><td>queries against an unseen tenant return empty, not error</td></tr>
+    <tr><td>RoundTrip</td><td>3</td><td>adversarial string values (emoji, unicode, SQL-shaped, leading/trailing whitespace, 10k chars), int64 fidelity, large payload bodies</td></tr>
+    <tr><td>Concurrency</td><td>5</td><td>distinct-keys-no-lost-writes, <strong>same-key-single-winner</strong>, device-upsert-same-key-single-row, update-status concurrency, read-your-writes</td></tr>
+    <tr><td>KeyEdge</td><td>3</td><td>long notification ids (256 chars), separator-byte collisions in composite keys, case-sensitive device types</td></tr>
+  </table>
+
+  <p>
+    All shipped drivers pass <strong>24/24</strong>:
+  </p>
+  <ul>
+    <li><a href="/notify/docs/store/memory">memory</a> — differential reference</li>
+    <li><a href="/notify/docs/store/postgres">postgres</a> — see <a href="https://github.com/elloloop/notify/blob/main/store/postgres/CONFORMANCE.md">store/postgres/CONFORMANCE.md</a></li>
+    <li><a href="/notify/docs/store/entdb">entdb</a> — see <a href="https://github.com/elloloop/notify/blob/main/store/entdb/CONFORMANCE.md">store/entdb/CONFORMANCE.md</a></li>
+  </ul>
+
+  <h2>Adding a new driver</h2>
+  <ol>
+    <li>Create <code>store/&lt;driver&gt;/</code> with the implementation.</li>
+    <li>Add <code>store/&lt;driver&gt;/&lt;driver&gt;_test.go</code> that runs the suite:</li>
+  </ol>
+  <Code code={`func TestConformance(t *testing.T) {
+    conformance.RunConformance(t, conformance.Driver{
+        Name: "mydriver",
+        New: func(t *testing.T) notify.Store {
+            return mydriver.New(...)
+        },
+    })
+}`} lang="go" />
+  <ol start="3">
+    <li>Wire the driver into <code>.github/workflows/conformance.yml</code>'s matrix.</li>
+    <li>Run <code>go test ./store/&lt;driver&gt;/... -race -count=1</code>. Any failing subtest gets a one-line root-cause attribution in <code>store/&lt;driver&gt;/CONFORMANCE.md</code> — see the existing two as templates.</li>
+  </ol>
+
+  <p>
+    The CI check <code>Conformance / &lt;driver&gt;</code> is what branch
+    protection pins. A driver that doesn't pass cannot land.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a> — every subtest, what it catches</li>
+    <li><a href="/notify/docs/store/memory">Memory driver</a></li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a></li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a></li>
+  </ul>
+</DocsLayout>

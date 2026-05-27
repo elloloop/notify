@@ -1,0 +1,172 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Observability">
+  <h1>Observability</h1>
+  <p>
+    notify exposes structured JSON logs to stderr, a <code>/healthz</code>
+    endpoint for liveness, and a <code>/metrics</code> endpoint for
+    Prometheus scrapers. The metrics endpoint always returns a parseable
+    body so a scraper hitting it never sees a 404.
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    Setting up dashboards, debugging a slow tenant, wiring an alerting
+    rule, or chasing an intermittent timeout in production.
+  </p>
+
+  <h2>Logging</h2>
+  <p>
+    Logs are emitted via Go's <code>log/slog</code> with a JSON handler
+    writing to stderr at the level set by <code>NOTIFY_LOG_LEVEL</code>
+    (default <code>info</code>). One event per line, no header, ingest
+    directly into Loki / Datadog / Splunk / CloudWatch.
+  </p>
+
+  <h3>What gets logged</h3>
+  <ul>
+    <li><code>server_listen</code> — one line per listener (client / internal / metrics).</li>
+    <li><code>notifyd_starting</code> — boot banner with version, commit, store driver, live-connections toggle, listener ports.</li>
+    <li><code>stream_open</code> / <code>stream_close</code> — every <code>StreamEvents</code> session, including <code>connection_id</code>, <code>user_id</code>, <code>tenant_id</code>, <code>device_type</code>.</li>
+    <li><code>event_queue_full</code> — one log per dropped event when a client buffer overflows.</li>
+    <li><code>retry_failed</code> — per-attempt error from the at-least-once retry tracker (key, connection_id, attempt, error).</li>
+    <li>Per-RPC logging interceptor — one line per Connect call with the procedure name and duration.</li>
+    <li><code>server_shutdown_signal</code> / <code>server_shutdown_error</code> — graceful shutdown.</li>
+  </ul>
+
+  <h3>Sample log line</h3>
+  <Code code={`{
+  "time": "2026-05-27T05:14:32.108Z",
+  "level": "INFO",
+  "msg": "stream_open",
+  "connection_id": "8b9f...",
+  "user_id": "user-alice",
+  "tenant_id": "acme",
+  "device_type": "browser"
+}`} lang="json" />
+
+  <h3>Setting the level</h3>
+  <Code code={`# verbose — shows the per-RPC log lines from the logging interceptor
+-e NOTIFY_LOG_LEVEL=debug
+
+# default — boot, stream lifecycle, shutdown, errors
+-e NOTIFY_LOG_LEVEL=info
+
+# warnings + errors only — recommended for high-traffic production
+-e NOTIFY_LOG_LEVEL=warn
+
+# errors only
+-e NOTIFY_LOG_LEVEL=error`} lang="bash" />
+
+  <h2>Health checks</h2>
+  <Code code={`curl -s http://localhost:9090/healthz
+# {"status":"ok"}`} lang="bash" />
+
+  <ul>
+    <li><strong>HTTP 200</strong> with <code>{`{"status":"ok"}`}</code> once <code>Server.Run</code> has bound all listeners.</li>
+    <li><strong>HTTP 503</strong> with <code>{`{"status":"not_ready"}`}</code> after <code>Shutdown</code> begins and before the process exits.</li>
+  </ul>
+
+  <p>An alias <code>/health</code> is registered for tool-muscle-memory.</p>
+
+  <h3>Kubernetes probes</h3>
+  <Code code={`livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 9090
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 9090
+  initialDelaySeconds: 2
+  periodSeconds: 5`} lang="yaml" />
+
+  <p>
+    The readiness probe will start failing the instant
+    <code>Shutdown</code> begins, so an in-flight rolling update stops
+    sending new traffic to the pod immediately while
+    <code>Shutdown</code> drains in-flight requests.
+  </p>
+
+  <h2>Metrics</h2>
+  <p>
+    <code>/metrics</code> on the metrics port returns
+    <code>text/plain; version=0.0.4</code> — the standard Prometheus
+    exposition. v0.1 ships a placeholder body so scrapers don't 404;
+    real metric series land in a follow-up wave without changing the
+    route.
+  </p>
+
+  <Code code={`curl -s http://localhost:9090/metrics
+# # notify metrics — placeholder`} lang="bash" />
+
+  <h3>Prometheus scrape config</h3>
+  <Code code={`# prometheus.yml
+scrape_configs:
+  - job_name: notify
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['notify:9090']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance`} lang="yaml" />
+
+  <h3>Counter shapes the follow-up wave will ship</h3>
+  <p>
+    Once the registry is wired, expect these series. Labels are
+    intentionally cardinality-bounded — no per-tenant labels.
+  </p>
+  <table>
+    <tr><th>Metric</th><th>Type</th><th>Labels</th></tr>
+    <tr><td><code>notify_notify_requests_total</code></td><td>Counter</td><td><code>code</code></td></tr>
+    <tr><td><code>notify_send_total</code></td><td>Counter</td><td><code>channel</code>, <code>provider</code>, <code>status</code></td></tr>
+    <tr><td><code>notify_send_duration_seconds</code></td><td>Histogram</td><td><code>channel</code>, <code>provider</code></td></tr>
+    <tr><td><code>notify_store_op_total</code></td><td>Counter</td><td><code>op</code>, <code>code</code></td></tr>
+    <tr><td><code>notify_store_op_duration_seconds</code></td><td>Histogram</td><td><code>op</code></td></tr>
+    <tr><td><code>notify_live_connections</code></td><td>Gauge</td><td><code>device_type</code></td></tr>
+    <tr><td><code>notify_stream_events_total</code></td><td>Counter</td><td><code>kind</code></td></tr>
+  </table>
+
+  <h2>Tracing (future)</h2>
+  <p>
+    notify does not emit OpenTelemetry spans today. The Connect
+    interceptors are the right place to add them; once the
+    follow-up lands, set <code>OTEL_*</code> env vars per the standard
+    Go OTel SDK auto-configuration and traces will surface in the
+    backend of your choice.
+  </p>
+
+  <h2>Recipe: structured-logs pipeline</h2>
+  <p>
+    Loki + Grafana is the cheapest path for JSON logs. Drop this in your
+    promtail config:
+  </p>
+  <Code code={`scrape_configs:
+  - job_name: notify
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: notify
+          __path__: /var/log/notify/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            user_id: user_id
+            tenant_id: tenant_id
+      - labels:
+          level:`} lang="yaml" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/operations/shutdown">Graceful shutdown</a></li>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a></li>
+    <li><a href="/notify/docs/deployment/kubernetes">Kubernetes deployment</a></li>
+  </ul>
+</DocsLayout>

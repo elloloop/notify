@@ -1,0 +1,312 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="API Reference">
+  <h1>gRPC / Connect API Reference</h1>
+  <p>
+    Two Connect services live in
+    <a href="https://github.com/elloloop/notify/tree/main/proto/notify/v1">proto/notify/v1</a>.
+    All RPCs accept JSON over HTTP/1 + HTTP/2 (Connect) <em>and</em>
+    binary gRPC — the wire format is negotiated by the
+    <code>Content-Type</code> header. Field numbers are frozen forever;
+    additive fields land at the end with a new number, never reuse,
+    never renumber.
+  </p>
+
+  <h2>Quick navigation</h2>
+  <ul>
+    <li><a href="#enums">Enums</a> — DeliveryChannel, DeliveryStatus, DeviceType</li>
+    <li><a href="#notificationinternalservice">NotificationInternalService.Notify</a> — backend producers</li>
+    <li><a href="#notificationclientservice">NotificationClientService</a> — browser / mobile recipients</li>
+    <li><a href="#error-codes">Error codes</a></li>
+  </ul>
+
+  <h2 id="enums">Enums</h2>
+
+  <h3>DeliveryChannel</h3>
+  <Code code={`enum DeliveryChannel {
+  DELIVERY_CHANNEL_UNSPECIFIED = 0;
+  DELIVERY_CHANNEL_IN_APP      = 1;
+  DELIVERY_CHANNEL_EMAIL       = 2;
+  DELIVERY_CHANNEL_WEB_PUSH    = 3;
+  DELIVERY_CHANNEL_MOBILE_PUSH = 4;
+  DELIVERY_CHANNEL_SMS         = 5;
+  DELIVERY_CHANNEL_WHATSAPP    = 6;
+}`} lang="proto" />
+
+  <p>
+    The string form used in <code>NotifyRequest.addresses.byChannel</code>
+    keys is the lowercase suffix: <code>in_app</code>,
+    <code>email</code>, <code>web_push</code>, <code>mobile_push</code>,
+    <code>sms</code>, <code>whatsapp</code>. (In-app needs no entry —
+    destination is the user id itself.)
+  </p>
+
+  <h3>DeliveryStatus</h3>
+  <Code code={`enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_PENDING     = 1;  // stored, not yet handed to a provider
+  DELIVERY_STATUS_DELIVERED   = 2;  // provider accepted the message
+  DELIVERY_STATUS_ACKED       = 3;  // transport-level confirmation (e.g. push receipt)
+  DELIVERY_STATUS_READ        = 4;  // recipient-driven
+  DELIVERY_STATUS_FAILED      = 5;  // provider rejection
+}`} lang="proto" />
+
+  <h3>DeviceType</h3>
+  <Code code={`enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  DEVICE_TYPE_BROWSER     = 1;
+  DEVICE_TYPE_ANDROID     = 2;
+  DEVICE_TYPE_IOS         = 3;
+}`} lang="proto" />
+
+  <p>
+    The platform supports at most one registered token per
+    <code>(user, device_type)</code>. Re-registering rotates the token
+    in place; it does not create a new device row.
+  </p>
+
+  <h2 id="notificationinternalservice">NotificationInternalService</h2>
+  <p>
+    Backend-to-backend surface. Speaks gRPC and Connect.
+    Auth is <code>X-Notify-Internal-Token</code> at the transport layer.
+  </p>
+
+  <h3>Notify</h3>
+  <Code code={`service NotificationInternalService {
+  // Creates per-user notification rows and attempts immediate delivery
+  // for every (user, channel) where a provider+destination is configured.
+  // Storage is idempotent on (tenant_id, user_id, notification_id).
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+}
+
+message NotifyRequest {
+  string tenant_id        = 1;
+  string notification_id  = 2;   // caller idempotency key
+  repeated string user_ids = 3;
+  repeated DeliveryChannel channels = 4;  // empty = all enabled channels
+  string subject_ref      = 5;   // opaque; platform never interprets
+  string subject_type     = 6;   // opaque; platform never interprets
+  string title            = 7;
+  string body             = 8;
+  map<string, ChannelAddresses> addresses = 9;   // userID → {byChannel: {channel: address}}
+}
+
+message ChannelAddresses {
+  map<string, string> by_channel = 1;
+}
+
+message NotifyResponse {
+  int32 delivered = 1;   // provider accepted at least one (user, channel) row
+  int32 pending   = 2;   // stored but no active provider or no destination
+  int32 failed    = 3;   // provider returned an error
+}`} lang="proto" />
+
+  <p><strong>Wire path</strong>: <code>POST /elloloop.notify.v1.NotificationInternalService/Notify</code></p>
+
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "task-42-comment-7",
+    "userIds": ["user-alice", "user-bob"],
+    "channels": ["DELIVERY_CHANNEL_IN_APP", "DELIVERY_CHANNEL_EMAIL"],
+    "subjectRef": "task:42",
+    "subjectType": "task",
+    "title": "New comment",
+    "body": "Bob commented on Task 42",
+    "addresses": {
+      "user-alice": { "byChannel": { "email": "alice@example.com" } },
+      "user-bob":   { "byChannel": { "email": "bob@example.com" } }
+    }
+  }'`} lang="bash" title="cURL" />
+
+  <p><strong>Errors</strong>:</p>
+  <ul>
+    <li><code>InvalidArgument</code> — <code>tenant_id</code>, <code>notification_id</code>, or <code>user_ids</code> empty.</li>
+    <li><code>Unauthenticated</code> — missing or mismatched <code>X-Notify-Internal-Token</code>.</li>
+    <li><code>Internal</code> — store error (DB unreachable, schema migration not applied, etc.).</li>
+  </ul>
+
+  <h2 id="notificationclientservice">NotificationClientService</h2>
+  <p>
+    Client-facing surface for browsers and mobile apps. Speaks Connect
+    HTTP/2. Auth is <code>Authorization: Bearer &lt;JWT&gt;</code>.
+    Tenant is derived from the JWT — request bodies never carry a tenant
+    field.
+  </p>
+
+  <h3>StreamEvents</h3>
+  <Code code={`rpc StreamEvents(StreamEventsRequest) returns (stream StreamEvent);
+
+message StreamEventsRequest {
+  DeviceType device_type = 1;
+}
+
+message StreamEvent {
+  string session_id = 1;
+  oneof event {
+    NotificationEvent notification = 2;
+    DataChangeEvent   data_change  = 3;
+    HeartbeatEvent    heartbeat    = 4;
+  }
+}
+
+message NotificationEvent { Notification notification = 1; }
+
+message DataChangeEvent {
+  string idempotency_key = 1;
+  string subject_ref     = 2;
+  string subject_type    = 3;
+}
+
+message HeartbeatEvent { int64 timestamp_ms = 1; }
+
+message Notification {
+  string id              = 1;   // store id; pass to AckNotification
+  string notification_id = 2;   // producer's idempotency key
+  string subject_ref     = 3;
+  string subject_type    = 4;
+  string title           = 5;
+  string body            = 6;
+  DeliveryChannel channel = 7;
+  DeliveryStatus  status  = 8;
+  int64 created_at_ms     = 9;
+  int64 delivered_at_ms   = 10;
+  int64 ack_at_ms         = 11;
+  int64 read_at_ms        = 12;
+}`} lang="proto" />
+
+  <p>
+    Long-lived server-stream. The first event is always a
+    <code>HeartbeatEvent</code> carrying the assigned
+    <code>session_id</code> so the client can target
+    <code>AckDataChange</code> back at this exact connection.
+  </p>
+
+  <p><strong>Errors</strong>:</p>
+  <ul>
+    <li><code>Unauthenticated</code> — missing / invalid / expired JWT.</li>
+    <li><code>Unimplemented</code> — <code>NOTIFY_LIVE_CONNECTIONS_ENABLED=false</code>.</li>
+    <li><code>Canceled</code> — client disconnect, server shutdown.</li>
+  </ul>
+
+  <h3>GetNotifications</h3>
+  <Code code={`rpc GetNotifications(GetNotificationsRequest) returns (GetNotificationsResponse);
+
+message GetNotificationsRequest {
+  string cursor      = 1;   // opaque; round-trip the previous response's next_cursor
+  int32  limit       = 2;   // 1..100; 0 → 20 default
+  bool   unread_only = 3;
+}
+
+message GetNotificationsResponse {
+  repeated Notification notifications = 1;
+  string next_cursor = 2;   // empty on the last page
+  int32  unread_count = 3;   // total not-yet-read, independent of page window
+}`} lang="proto" />
+
+  <p>
+    Newest-first. Cursor is strict <code>&lt;</code> on
+    <code>created_at_ms</code>. <code>unread_count</code> is the global
+    not-yet-read total, not the count on this page.
+  </p>
+
+  <Code code={`curl -sX POST http://notify:8080/elloloop.notify.v1.NotificationClientService/GetNotifications \\
+  -H "Authorization: Bearer $JWT" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"limit": 20}'`} lang="bash" />
+
+  <h3>AckNotification</h3>
+  <Code code={`rpc AckNotification(AckNotificationRequest) returns (AckNotificationResponse);
+
+message AckNotificationRequest {
+  string id = 1;   // store id (Notification.id), NOT the producer's notification_id
+}
+
+message AckNotificationResponse {}`} lang="proto" />
+
+  <p>
+    Marks one row as <code>Read</code> and stamps
+    <code>read_at_ms</code>. Idempotent — repeated calls are no-ops.
+    Cross-user / cross-tenant attempts return <code>NotFound</code>
+    (never <code>PermissionDenied</code>, which would leak the existence
+    of someone else's row).
+  </p>
+
+  <h3>AckDataChange</h3>
+  <Code code={`rpc AckDataChange(AckDataChangeRequest) returns (AckDataChangeResponse);
+
+message AckDataChangeRequest {
+  string idempotency_key = 1;
+  string session_id      = 2;   // from StreamEvent.session_id
+}
+
+message AckDataChangeResponse {}`} lang="proto" />
+
+  <p>
+    Cancels any pending retries for the
+    <code>(idempotency_key, session_id)</code> pair on the in-memory
+    RetryTracker. Sessions older than the process lifetime are silently
+    ignored (the tracker treats unknown entries as no-ops).
+  </p>
+
+  <h3>RegisterPushToken</h3>
+  <Code code={`rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
+
+message RegisterPushTokenRequest {
+  DeviceType device_type = 1;
+  string token = 2;
+}
+
+message RegisterPushTokenResponse {}`} lang="proto" />
+
+  <p>
+    Upserts the <code>(user, device_type)</code> → <code>token</code>
+    row. Re-calling rotates the token in place. For Web Push the
+    <code>token</code> is the JSON-stringified
+    <code>PushSubscription</code>; for FCM it is the FCM registration
+    token.
+  </p>
+
+  <h2 id="error-codes">Error codes</h2>
+  <table>
+    <tr><th>Code</th><th>When</th></tr>
+    <tr><td><code>InvalidArgument</code></td><td>Missing required field, malformed cursor, empty user_ids on Notify, empty id on AckNotification.</td></tr>
+    <tr><td><code>Unauthenticated</code></td><td>Missing or invalid <code>Authorization</code> / <code>X-Notify-Internal-Token</code> header. Includes expired JWT.</td></tr>
+    <tr><td><code>NotFound</code></td><td>Acking a row that doesn't belong to the calling user (or doesn't exist).</td></tr>
+    <tr><td><code>Unimplemented</code></td><td><code>StreamEvents</code> when <code>NOTIFY_LIVE_CONNECTIONS_ENABLED=false</code>.</td></tr>
+    <tr><td><code>Canceled</code></td><td>Stream interrupted (client close, server shutdown).</td></tr>
+    <tr><td><code>Internal</code></td><td>Store error, provider error not absorbed by the orchestrator, panic recovery.</td></tr>
+  </table>
+
+  <h2>Generating clients</h2>
+  <p>
+    Use <code>buf</code> against the published proto bundle on a tagged
+    release:
+  </p>
+  <Code code={`# Download the proto bundle for the release you target.
+gh release download v0.1.0 --repo elloloop/notify --pattern 'notify-protos-*.tar.gz'
+tar xzf notify-protos-0.1.0.tar.gz
+
+# Generate Go, TypeScript, Python stubs.
+buf generate`} lang="bash" />
+
+  <p>
+    Or import the generated stubs from the Go module:
+  </p>
+  <Code code={`import (
+    notifyv1 "github.com/elloloop/notify/gen/go/notify/v1"
+    "github.com/elloloop/notify/gen/go/notify/v1/notifyv1connect"
+)`} lang="go" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/auth-model">Auth Model</a></li>
+    <li><a href="/notify/docs/examples/send-notification">Send a notification</a></li>
+    <li><a href="/notify/docs/examples/subscribe-sse">Subscribe over SSE</a></li>
+  </ul>
+</DocsLayout>

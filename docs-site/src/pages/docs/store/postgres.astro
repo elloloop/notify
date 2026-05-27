@@ -1,0 +1,193 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Postgres store">
+  <h1>Postgres store</h1>
+  <p>
+    The Postgres driver is the typical production shape: two tables, two
+    indexes per table, <code>pgx</code> v5 connection pool, embedded
+    migrations applied under <code>pg_advisory_lock</code>. Composite
+    uniqueness is enforced by Postgres, not the application — that is
+    what makes the conformance suite's same-key concurrency tests pass
+    cleanly.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Default choice for production unless you already run EntDB. Works
+    with any managed Postgres 14+ (RDS, Azure Database for PostgreSQL,
+    Cloud SQL).
+  </p>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_STORE_DRIVER=postgres \\
+-e NOTIFY_POSTGRES_DSN='postgres://notify:notify@db.internal:5432/notify?sslmode=require' \\
+-e NOTIFY_POSTGRES_AUTOMIGRATE=true`} lang="bash" />
+
+  <p>
+    See <a href="/notify/docs/installation/store-setup#postgres">Store
+    Setup → Postgres</a> for the DSN options and the provisioning SQL.
+  </p>
+
+  <h2>Schema</h2>
+  <Code code={`CREATE TABLE notify_notifications (
+    id              uuid PRIMARY KEY,
+    tenant_id       text   NOT NULL,
+    user_id         text   NOT NULL,
+    notification_id text   NOT NULL,
+    subject_ref     text   NOT NULL DEFAULT '',
+    subject_type    text   NOT NULL DEFAULT '',
+    title           text   NOT NULL DEFAULT '',
+    body            text   NOT NULL DEFAULT '',
+    channel         text   NOT NULL DEFAULT '',
+    status          text   NOT NULL,
+    created_at_ms   bigint NOT NULL,
+    delivered_at_ms bigint NOT NULL DEFAULT 0,
+    ack_at_ms       bigint NOT NULL DEFAULT 0,
+    read_at_ms      bigint NOT NULL DEFAULT 0,
+    UNIQUE (tenant_id, user_id, notification_id)
+);
+
+CREATE INDEX notify_notifications_user_created
+  ON notify_notifications (tenant_id, user_id, created_at_ms DESC, id DESC);
+
+CREATE INDEX notify_notifications_user_unread
+  ON notify_notifications (tenant_id, user_id)
+  WHERE status <> 'read';
+
+CREATE TABLE notify_devices (
+    id             uuid PRIMARY KEY,
+    tenant_id      text   NOT NULL,
+    user_id        text   NOT NULL,
+    device_type    text   NOT NULL,
+    token          text   NOT NULL DEFAULT '',
+    created_at_ms  bigint NOT NULL DEFAULT 0,
+    last_active_ms bigint NOT NULL DEFAULT 0,
+    UNIQUE (tenant_id, user_id, device_type)
+);
+
+CREATE INDEX notify_devices_user
+  ON notify_devices (tenant_id, user_id, device_type);`} lang="sql" />
+
+  <p>Three things matter about this schema:</p>
+  <ol>
+    <li><strong>Composite uniqueness is enforced by Postgres.</strong> The <code>UNIQUE(tenant_id, user_id, notification_id)</code> constraint is what makes <code>ON CONFLICT DO NOTHING</code> safe for the idempotent <code>CreateNotification</code> and what makes the same-key concurrency test pass without an application-level mutex.</li>
+    <li><strong>The paging index is the tuple the query sorts by.</strong> <code>(tenant_id, user_id, created_at_ms DESC, id DESC)</code> matches <code>ORDER BY created_at_ms DESC, id DESC</code>, so paging is an index scan, not a sort node.</li>
+    <li><strong>The unread partial index keeps unreadCount cheap.</strong> Even with millions of read rows, the unread count is a scan over the partial index.</li>
+  </ol>
+
+  <h2>Idempotency / upsert pattern</h2>
+  <p>
+    <code>CreateNotification</code>:
+  </p>
+  <Code code={`INSERT INTO notify_notifications (
+    id, tenant_id, user_id, notification_id,
+    subject_ref, subject_type, title, body, channel,
+    status, created_at_ms
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (tenant_id, user_id, notification_id) DO NOTHING
+RETURNING id;`} lang="sql" />
+
+  <p>
+    If <code>RETURNING</code> produces a row, the writer won the
+    insert and gets <code>created=true</code>. If <code>pgx.ErrNoRows</code>
+    comes back (ON CONFLICT absorbed the dup), a follow-up SELECT
+    recovers the canonical id and returns <code>created=false</code>.
+    This satisfies both the basic Idempotency test <em>and</em> the
+    same-key concurrency test: exactly one goroutine gets the
+    <code>RETURNING</code> row, the rest take the recovery path.
+  </p>
+
+  <p>
+    <code>UpsertDevice</code>:
+  </p>
+  <Code code={`INSERT INTO notify_devices (
+    id, tenant_id, user_id, device_type, token,
+    created_at_ms, last_active_ms
+) VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (tenant_id, user_id, device_type) DO UPDATE SET
+    token          = EXCLUDED.token,
+    last_active_ms = EXCLUDED.last_active_ms
+RETURNING *;`} lang="sql" />
+
+  <p>
+    <code>created_at_ms</code> is intentionally not touched on conflict
+    — token rotation preserves the original create time.
+  </p>
+
+  <p>
+    <code>UpdateStatus</code> stamps the matching <code>*_at_ms</code> in
+    one statement via a <code>CASE</code>:
+  </p>
+  <Code code={`UPDATE notify_notifications
+SET status = $2,
+    delivered_at_ms = CASE WHEN $2 = 'delivered' THEN $3 ELSE delivered_at_ms END,
+    ack_at_ms       = CASE WHEN $2 = 'acked'     THEN $3 ELSE ack_at_ms       END,
+    read_at_ms      = CASE WHEN $2 = 'read'      THEN $3 ELSE read_at_ms      END
+WHERE tenant_id = $1 AND id = $4;`} lang="sql" />
+
+  <p>
+    A <code>RowsAffected() == 0</code> result maps to
+    <code>notify.ErrNotFound</code>.
+  </p>
+
+  <h2>Pagination</h2>
+  <ul>
+    <li><strong>Order</strong>: <code>ORDER BY created_at_ms DESC, id DESC</code>.</li>
+    <li><strong>Cursor</strong>: <code>strconv.FormatInt(lastRow.CreatedAtMS, 10)</code> — same wire format as the memory driver, so cross-driver tests interchange.</li>
+    <li><strong>Next page</strong>: <code>WHERE created_at_ms &lt; $cursor</code> (strict <code>&lt;</code>, per the contract).</li>
+    <li><strong>Detect next page</strong>: <code>LIMIT n+1</code>. If you get back <code>n+1</code> rows, slice to <code>n</code> and emit <code>nextCursor = items[n-1].CreatedAtMS</code>. Saves a second round-trip and a <code>count(*)</code>.</li>
+    <li><strong><code>unreadCount</code></strong> is a separate <code>SELECT count(*) FROM ... WHERE status &lt;&gt; 'read'</code> — independent of the page window and any <code>UnreadOnly</code> filter.</li>
+  </ul>
+
+  <h2>Migrations</h2>
+  <p>
+    Embedded as a Go slice in <code>store/postgres/migrations.go</code>;
+    applied under <code>pg_advisory_lock(0x6E6F74696679_00)</code> so
+    concurrent process boots serialise on the lock instead of racing
+    the DDL. The bookkeeping table <code>notify_schema_migrations</code>
+    is idempotent — boots after the first see it and skip applied
+    versions.
+  </p>
+
+  <p>
+    Migrations are append-only. A new schema change becomes a new
+    <code>migration{`{}`}</code> entry at the end; shipped versions never get
+    edited. The advisory lock key is unlikely to collide
+    (<code>"notify\0"</code> in hex), but if another driver in the same
+    database picks the same key its migrations would block on ours.
+  </p>
+
+  <h2>Connection pool</h2>
+  <ul>
+    <li><code>MaxConns = 25</code> by default — matches identity's <code>DefaultMaxConns</code>.</li>
+    <li><code>MaxConnLifetime = 1h</code>, <code>MaxConnIdleTime = 30m</code> — cooperate with pgbouncer / Azure idle reapers.</li>
+  </ul>
+
+  <h2>Conformance results</h2>
+  <p>
+    24/24 pass under <code>-race</code>. Total wall time after the
+    testcontainers Postgres warm-up is ~3.3s on Apple Silicon. See
+    <a href="https://github.com/elloloop/notify/blob/main/store/postgres/CONFORMANCE.md">store/postgres/CONFORMANCE.md</a>
+    for the per-subtest table and design notes.
+  </p>
+
+  <h2>Running the suite locally</h2>
+  <Code code={`# Requires Docker (the suite uses testcontainers-go).
+go test ./store/postgres/... -race -count=1 -v`} lang="bash" />
+
+  <p>
+    The first run pulls <code>postgres:16.13-alpine3.23</code>; subsequent
+    runs reuse the layer cache.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/store-setup">Store Setup → Postgres</a></li>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a></li>
+    <li><a href="/notify/docs/store/memory">Memory driver</a></li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a></li>
+  </ul>
+</DocsLayout>

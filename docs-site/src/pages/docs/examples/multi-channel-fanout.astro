@@ -1,0 +1,195 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Example — Multi-Channel Fanout">
+  <h1>Multi-Channel Fanout</h1>
+  <p>
+    One <code>Notify</code> call, many recipients, many channels per
+    recipient. The orchestrator stores one row per
+    <code>(user, channel)</code>, attempts immediate delivery per row,
+    and returns aggregate counts so the producer knows what landed.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Business events that deserve every available rail: incident pages,
+    onboarding milestones, multi-recipient activity events ("Bob
+    commented on Task 42 — page Alice and Carol via in-app + email +
+    SMS").
+  </p>
+
+  <h2>The wire call</h2>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "incident-2026-05-27-001",
+    "userIds": ["alice", "bob", "carol"],
+    "channels": [
+      "DELIVERY_CHANNEL_IN_APP",
+      "DELIVERY_CHANNEL_EMAIL",
+      "DELIVERY_CHANNEL_SMS"
+    ],
+    "subjectRef": "incident:i-1287",
+    "subjectType": "incident",
+    "title": "P1: checkout service unavailable",
+    "body": "Pagerduty incident i-1287 fired at 05:14 UTC. Runbook: https://example.com/rb",
+    "addresses": {
+      "alice": {
+        "byChannel": {
+          "email": "alice@example.com",
+          "sms":   "+15555550199"
+        }
+      },
+      "bob": {
+        "byChannel": {
+          "email": "bob@example.com"
+        }
+      },
+      "carol": {
+        "byChannel": {
+          "sms": "+15555550158"
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <h2>What happens, row by row</h2>
+  <table>
+    <tr><th>User</th><th>Channel</th><th>Address resolved?</th><th>Provider configured?</th><th>Result</th></tr>
+    <tr><td>alice</td><td>in_app</td><td>yes (user id)</td><td>yes (auto)</td><td>delivered if live, else pending</td></tr>
+    <tr><td>alice</td><td>email</td><td>yes (alice@example.com)</td><td>yes</td><td>delivered</td></tr>
+    <tr><td>alice</td><td>sms</td><td>yes (+15555550199)</td><td>yes</td><td>delivered</td></tr>
+    <tr><td>bob</td><td>in_app</td><td>yes</td><td>yes</td><td>delivered if live, else pending</td></tr>
+    <tr><td>bob</td><td>email</td><td>yes (bob@example.com)</td><td>yes</td><td>delivered</td></tr>
+    <tr><td>bob</td><td>sms</td><td>no</td><td>yes</td><td><strong>pending</strong> (no address)</td></tr>
+    <tr><td>carol</td><td>in_app</td><td>yes</td><td>yes</td><td>delivered if live, else pending</td></tr>
+    <tr><td>carol</td><td>email</td><td>no</td><td>yes</td><td><strong>pending</strong> (no address)</td></tr>
+    <tr><td>carol</td><td>sms</td><td>yes (+15555550158)</td><td>yes</td><td>delivered</td></tr>
+  </table>
+
+  <p>
+    The orchestrator stores all nine rows (3 users × 3 channels) and
+    reports a <code>NotifyResponse</code> like:
+  </p>
+  <Code code={`{"delivered": 5, "pending": 4, "failed": 0}`} lang="json" />
+
+  <p>
+    Two of those <code>pending</code> are "no address"; the other two
+    are "user offline for in-app". Both are recoverable: the missing
+    addresses can be supplied in a future retry; the in-app rows will
+    surface on the next <code>StreamEvents</code> open via
+    <code>GetNotifications</code>.
+  </p>
+
+  <h2>Idempotency across fanout</h2>
+  <p>
+    The single <code>notification_id</code> covers <em>all nine</em>
+    rows. A second call with the same
+    <code>(tenant, notification_id)</code> but a wider channel list
+    will <strong>not</strong> create new rows for the already-stored
+    (user, channel) pairs — the Store's idempotency key is
+    <code>(tenant, user, notification_id)</code>, and that triple
+    matches per row. The second call's NotifyResponse will report
+    those rows as <code>pending</code> (skipped at the storage layer)
+    or re-deliver via the providers if a provider is now available
+    where one wasn't before.
+  </p>
+  <p>
+    The practical recommendation: choose the channel list <em>once</em>,
+    at the producer, when the event is generated. Retries should not
+    change the channel set; if you need to add a channel, mint a new
+    <code>notification_id</code> for the addition.
+  </p>
+
+  <h2>Empty channels = all enabled</h2>
+  <p>
+    Omitting <code>channels</code> tells the orchestrator to use every
+    channel that has both an active provider AND a destination for the
+    user. For the example above with all three providers configured,
+    leaving <code>channels</code> off produces the same nine rows.
+  </p>
+  <p>
+    The difference matters when a provider is disabled: with
+    <code>channels=[in_app, email, sms]</code> on a deployment where
+    SMS is disabled, the SMS rows are stored as <code>pending</code>
+    (recovery is "wire a Twilio provider, re-run"). With empty
+    <code>channels</code> on the same deployment, SMS isn't part of the
+    effective set at all — no row stored, no recovery story needed.
+  </p>
+
+  <h2>Recovery via the inbox</h2>
+  <p>
+    A user who logs in after the fanout opens
+    <code>GetNotifications</code> and sees every row addressed to them,
+    regardless of delivery outcome. The in-app row with
+    <code>StatusPending</code> looks the same in the UI as a delivered
+    row — it just hadn't been pushed live yet.
+  </p>
+
+  <h2>Producer-side shape</h2>
+  <p>
+    For a real producer with a user-store integration, the addresses
+    map is usually built from a single query over your user table:
+  </p>
+  <Code code={`func sendIncidentPage(ctx context.Context, c *NotifyClient, incidentID string, userIDs []string) error {
+    contacts, err := userStore.LookupContacts(ctx, userIDs)
+    if err != nil {
+        return fmt.Errorf("lookup contacts: %w", err)
+    }
+
+    addrs := make(map[string]*notifyv1.ChannelAddresses, len(contacts))
+    for uid, c := range contacts {
+        m := map[string]string{}
+        if c.Email != ""  { m["email"] = c.Email }
+        if c.Phone != ""  { m["sms"]   = c.Phone }
+        if len(m) > 0 {
+            addrs[uid] = &notifyv1.ChannelAddresses{ByChannel: m}
+        }
+    }
+
+    _, err = c.Notify(ctx, &notifyv1.NotifyRequest{
+        TenantId:       "acme",
+        NotificationId: "incident-" + incidentID,
+        UserIds:        userIDs,
+        Channels: []notifyv1.DeliveryChannel{
+            notifyv1.DeliveryChannel_DELIVERY_CHANNEL_IN_APP,
+            notifyv1.DeliveryChannel_DELIVERY_CHANNEL_EMAIL,
+            notifyv1.DeliveryChannel_DELIVERY_CHANNEL_SMS,
+        },
+        SubjectRef:  "incident:" + incidentID,
+        SubjectType: "incident",
+        Title:       "P1: checkout service unavailable",
+        Body:        "Pagerduty incident " + incidentID + " fired.",
+        Addresses:   addrs,
+    })
+    return err
+}`} lang="go" />
+
+  <h2>Partial failure</h2>
+  <p>
+    A provider error on one (user, channel) row records that row as
+    <code>StatusFailed</code> and increments <code>NotifyResponse.failed</code>;
+    the rest of the fan-out continues. Storage errors abort the call
+    immediately (the platform cannot guarantee the remaining rows would
+    be stored either).
+  </p>
+  <p>
+    Producer-side strategy: log non-zero
+    <code>failed</code> for ops alerts; do not retry the whole call
+    automatically — the idempotency key ensures the stored rows aren't
+    duplicated, but it does not re-attempt the failed provider sends.
+    To re-send only the failed channel for the affected users, mint a
+    fresh <code>notification_id</code> with the narrowed audience.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/examples/send-notification">Send a notification</a></li>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a></li>
+    <li><a href="/notify/docs/api-reference/grpc#notificationinternalservice">API Reference: Notify</a></li>
+  </ul>
+</DocsLayout>

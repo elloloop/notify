@@ -1,0 +1,93 @@
+---
+import DocsLayout from "../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Introduction" hidePrevNext>
+  <h1>notify</h1>
+  <p>
+    Multi-channel notification platform as a single, deployable container.
+    Pull a pinned image, point it at a durable store (memory · Postgres ·
+    <a href="https://github.com/elloloop/tenant-shard-db">EntDB</a>),
+    configure one or more channel providers, and you have in-app real-time
+    SSE, email, web push, mobile push, SMS and WhatsApp delivery — all over
+    Connect-RPC (HTTP/JSON) and gRPC.
+  </p>
+
+  <h2>What you get</h2>
+  <ul>
+    <li><strong>In-app real-time</strong> — SSE/Connect stream of new notifications, data-change hints and heartbeats over one connection. Optional subsystem; turn it off and history still works.</li>
+    <li><strong>Email</strong> — pluggable provider via a narrow <code>Sender</code> interface. Ships with the elloloop EmailService backend; slots for SES, ACS, SMTP, SendGrid.</li>
+    <li><strong>SMS + WhatsApp</strong> — Twilio, with the WhatsApp channel automatically applying the <code>whatsapp:</code> prefix.</li>
+    <li><strong>Web Push</strong> — VAPID (RFC 8292) with <code>ErrSubscriptionGone</code> sentinel on 410 responses for token-purge logic.</li>
+    <li><strong>Mobile push</strong> — FCM HTTP v1 hand-rolled (~150 LOC), with <code>ErrUnregisteredToken</code> sentinel for the standard UNREGISTERED / NOT_FOUND cases.</li>
+    <li><strong>Pluggable store</strong> — memory, Postgres, EntDB. One <code>Store</code> contract; all drivers run the same 24-subtest conformance suite.</li>
+    <li><strong>Idempotency built in</strong> — every <code>Notify</code> call is keyed by <code>(tenant, user, notification_id)</code>. Retries never duplicate deliveries.</li>
+    <li><strong>Per-recipient lifecycle</strong> — <code>pending</code> → <code>delivered</code> → <code>acked</code> → <code>read</code> (or <code>failed</code>) tracked per row.</li>
+    <li><strong>Observability</strong> — slog JSON logs, <code>/healthz</code>, <code>/metrics</code> on a separate port.</li>
+    <li><strong>Standalone container</strong> — <code>cmd/notifyd</code> wires it all from environment variables; library mode is the same code, minus the wiring.</li>
+  </ul>
+
+  <h2>How it deploys</h2>
+  <p>
+    One container, three listeners. Treat it like
+    <a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db</a>
+    or <a href="https://github.com/elloloop/identity">identity</a>: pin a
+    tag, deploy once per environment. Auth is JWT (HS256) against a shared
+    secret — no callback into any consumer.
+  </p>
+
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  -e NOTIFY_AUTH_JWT_SECRET=$(openssl rand -hex 32) \\
+  -e NOTIFY_INTERNAL_TOKEN=$(openssl rand -hex 32) \\
+  -e NOTIFY_EMAIL_PROVIDER=none \\
+  ghcr.io/elloloop/notify:latest`} lang="bash" title="docker run" />
+
+  <p>The container exposes three ports:</p>
+  <ul>
+    <li><code>8080</code> — <code>NotificationClientService</code> (browser / mobile, Connect HTTP/2)</li>
+    <li><code>8081</code> — <code>NotificationInternalService</code> (backend producers, gRPC)</li>
+    <li><code>9090</code> — <code>/healthz</code> and <code>/metrics</code> (Prometheus exposition)</li>
+  </ul>
+
+  <h2>Two services, two audiences</h2>
+  <p>
+    The proto contract carries two services so the auth + transport story
+    cleanly splits the two callers:
+  </p>
+  <table>
+    <tr><th>Service</th><th>Caller</th><th>Auth</th></tr>
+    <tr><td><code>NotificationInternalService</code></td><td>Backend producers (your services that <em>send</em> notifications)</td><td><code>X-Notify-Internal-Token</code> shared secret</td></tr>
+    <tr><td><code>NotificationClientService</code></td><td>Browser + mobile clients (recipients reading + streaming)</td><td><code>Authorization: Bearer &lt;JWT&gt;</code></td></tr>
+  </table>
+
+  <h2>Storage layout</h2>
+  <p>
+    All durable state — notification rows and device registrations —
+    lives in the configured store. Memory is the in-process reference
+    used for tests and dev; Postgres uses <code>pgx</code>; EntDB
+    targets the v2 schema-aware mode (ADR-031) and rides server-enforced
+    composite-key uniqueness.
+  </p>
+  <table>
+    <tr><th>Type</th><th>Where (memory/postgres)</th><th>Where (entdb)</th></tr>
+    <tr><td>Notification</td><td><code>notify_notifications</code> table</td><td><code>UserNotification</code> node, <code>type_id = 1</code></td></tr>
+    <tr><td>Device</td><td><code>notify_devices</code> table</td><td><code>DeviceRegistration</code> node, <code>type_id = 2</code></td></tr>
+  </table>
+  <p>
+    notify runs its own EntDB instance; <code>type_id</code> values are
+    scoped to that deployment and do not collide with the identity
+    namespace.
+  </p>
+
+  <h2>Where to next</h2>
+  <ul>
+    <li><a href="/notify/docs/quickstart">Quick Start</a> — run the container and send your first notification end-to-end</li>
+    <li><a href="/notify/docs/concepts/architecture">Architecture</a> — how the pieces fit together</li>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a> — every <code>NOTIFY_*</code> variable</li>
+    <li><a href="/notify/docs/api-reference/grpc">API Reference</a> — every RPC, request, response, status code</li>
+    <li><a href="/notify/docs/examples/send-notification">Send a Notification</a> — Go, Python, cURL recipes</li>
+  </ul>
+</DocsLayout>

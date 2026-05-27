@@ -1,0 +1,157 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Channels & Providers">
+  <h1>Channels &amp; Providers</h1>
+  <p>
+    A <strong>channel</strong> is the <em>kind</em> of delivery rail:
+    in-app, email, web push, mobile push, SMS, WhatsApp. A
+    <strong>provider</strong> is the concrete backend that handles that
+    rail — Twilio for SMS, VAPID for web push, the emailservice Sender for
+    email, etc. notify lets you mix and match.
+  </p>
+
+  <h2>When to think in these terms</h2>
+  <p>
+    Whenever you ask "how do I send X over Y": <em>X is the channel, Y is
+    the provider</em>. The channel decides which destination shape applies
+    (an email address, an E.164 phone number, a device token, the user id);
+    the provider decides which API does the talking and which credentials
+    sit on disk.
+  </p>
+
+  <h2>Channels (the wire-stable set)</h2>
+  <Code code={`type ChannelKind string
+
+const (
+    ChannelInApp      ChannelKind = "in_app"
+    ChannelEmail      ChannelKind = "email"
+    ChannelWebPush    ChannelKind = "web_push"
+    ChannelMobilePush ChannelKind = "mobile_push"
+    ChannelSMS        ChannelKind = "sms"
+    ChannelWhatsApp   ChannelKind = "whatsapp"
+)`} lang="go" />
+
+  <p>
+    The proto enum (<code>DeliveryChannel</code>) carries the same set,
+    with frozen field numbers. Adding a new channel is an additive proto
+    change plus a new <code>ChannelKind</code> constant in
+    <code>notify/model.go</code> — never reuse, never renumber.
+  </p>
+
+  <h2>Provider taxonomy</h2>
+  <table>
+    <tr><th>Channel</th><th>Shipped providers</th><th>Future providers</th></tr>
+    <tr><td><code>email</code></td><td><code>emailservice</code> (DI Sender)</td><td><code>ses</code>, <code>acs</code>, <code>smtp</code>, <code>sendgrid</code></td></tr>
+    <tr><td><code>sms</code></td><td><code>twilio</code></td><td><code>sns</code>, <code>acs</code></td></tr>
+    <tr><td><code>whatsapp</code></td><td><code>twilio</code></td><td><code>meta</code></td></tr>
+    <tr><td><code>web_push</code></td><td><code>vapid</code></td><td>—</td></tr>
+    <tr><td><code>mobile_push</code></td><td><code>fcm</code></td><td><code>apns</code>, <code>azure</code>, <code>aws</code></td></tr>
+    <tr><td><code>in_app</code></td><td>built-in realtime engine</td><td>—</td></tr>
+  </table>
+
+  <h2>The Provider interface</h2>
+  <p>
+    Every provider satisfies one tiny contract:
+  </p>
+  <Code code={`type Provider interface {
+    Kind() ChannelKind                                  // which channel does this provider serve?
+    Name() string                                       // identifier surfaced in logs/metrics
+    Send(ctx context.Context, msg Message) (Receipt, error)
+}
+
+type Message struct {
+    Notification *Notification          // the persisted row (nil for fire-and-forget)
+    To           string                 // channel-specific destination
+    Title        string
+    Body         string
+    Data         map[string]string      // structured key/values for deep links
+}
+
+type Receipt struct {
+    ProviderMessageID string             // upstream id (Twilio SID, FCM message name, …)
+    Status            DeliveryStatus     // "" → StatusDelivered
+}`} lang="go" />
+
+  <p>
+    On error the orchestrator records the row as <code>StatusFailed</code>
+    and counts it in <code>NotifyResult.Failed</code>. The rest of the
+    fan-out continues.
+  </p>
+
+  <h2>How a channel becomes "active"</h2>
+  <p>
+    A channel is active <em>when a provider has been registered for it</em>.
+    Unregistered channels are still legal in a <code>NotifyRequest</code> —
+    the row is stored and counted as <code>Pending</code>, but no provider
+    call happens.
+  </p>
+
+  <p>In library mode you register explicitly:</p>
+  <Code code={`registry := notify.NewProviderRegistry()
+registry.Register(twilio.NewSMS(twilioClient))
+registry.Register(fcm.New(fcmCfg))
+notifier := notify.NewNotifier(store, registry)`} lang="go" />
+
+  <p>
+    In container mode <code>cmd/notifyd</code> registers providers based on
+    the configured <code>NOTIFY_&lt;CHANNEL&gt;_PROVIDER</code> blocks. An
+    empty block leaves the channel disabled.
+  </p>
+
+  <h2>Address resolution</h2>
+  <p>
+    The orchestrator resolves an address per <code>(user, channel)</code>
+    in this order:
+  </p>
+  <ol>
+    <li>If <code>NotifyRequest.Addresses[userID][channel]</code> is set, use it.</li>
+    <li>Otherwise, if the channel is <code>in_app</code>, use the user id itself.</li>
+    <li>Otherwise, no address — count as <code>Pending</code>.</li>
+  </ol>
+
+  <p>
+    The Addresses map is opt-in. For email/SMS/WhatsApp/web-push/mobile-push
+    you almost always supply it (or your producer reads it from your own
+    user store and assembles the map before calling Notify). For in-app
+    you almost never need it.
+  </p>
+
+  <Code code={`req := notify.NotifyRequest{
+    TenantID:       "acme",
+    NotificationID: "task-42-comment-7",
+    UserIDs:        []string{"alice", "bob"},
+    Channels:       []notify.ChannelKind{notify.ChannelInApp, notify.ChannelEmail},
+    Title:          "New comment",
+    Body:           "Bob commented on Task 42",
+    Addresses: map[string]map[notify.ChannelKind]string{
+        "alice": {notify.ChannelEmail: "alice@example.com"},
+        "bob":   {notify.ChannelEmail: "bob@example.com"},
+    },
+}`} lang="go" />
+
+  <h2>Why providers do not auto-purge dead tokens</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    Both web push (<code>ErrSubscriptionGone</code> on HTTP 410) and FCM
+    (<code>ErrUnregisteredToken</code> on UNREGISTERED / NOT_FOUND) expose
+    "the recipient endpoint is gone" as a sentinel error. The provider
+    never deletes the corresponding <code>Device</code> row itself — it
+    just surfaces the sentinel. Why? Because the device store is owned by
+    the orchestrator / caller, and a future caller may want to keep the
+    row for audit, retry from a fresher token, or analytics. Providers
+    are stateless from the platform's POV.
+  </blockquote>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/email">Email channel</a></li>
+    <li><a href="/notify/docs/channels/sms">SMS channel</a></li>
+    <li><a href="/notify/docs/channels/whatsapp">WhatsApp channel</a></li>
+    <li><a href="/notify/docs/channels/web-push">Web Push channel</a></li>
+    <li><a href="/notify/docs/channels/mobile-push">Mobile push channel</a></li>
+    <li><a href="/notify/docs/channels/in-app">In-app channel</a></li>
+  </ul>
+</DocsLayout>

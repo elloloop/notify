@@ -1,0 +1,215 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="In-App channel">
+  <h1>In-App channel</h1>
+  <p>
+    In-app delivery is a real-time push to any of the user's currently
+    open client connections via the
+    <code>NotificationClientService.StreamEvents</code> server-stream.
+    No provider configuration is needed — when the live-connections
+    subsystem is on, the in-app provider is auto-registered.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Anything you want to surface immediately in the active session: a new
+    chat message, an updated task list, a "your colleague joined the
+    document" presence event. The same rows are stored for catch-up via
+    <code>GetNotifications</code>, so a user who comes back online sees
+    the missed traffic.
+  </p>
+
+  <h2>How it works</h2>
+  <p>
+    The orchestrator's in-app provider holds a reference to the
+    realtime <code>Registry</code>:
+  </p>
+  <ol>
+    <li>A producer calls <code>Notify</code> with <code>DELIVERY_CHANNEL_IN_APP</code>.</li>
+    <li>The orchestrator stores the row (idempotent on the standard key).</li>
+    <li>It calls the in-app provider's <code>Send</code>.</li>
+    <li>The provider pushes the rendered <code>StreamEvent</code> to every live connection for the recipient via <code>Registry.Push</code>.</li>
+    <li>If 1+ connections accepted the event → <code>StatusDelivered</code>. If 0 connections (user offline) → <code>StatusPending</code>.</li>
+  </ol>
+
+  <h2>Pending vs Delivered for offline users</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    An in-app row to a user with no live connections gets
+    <code>StatusPending</code> — <em>not</em> a lying
+    <code>StatusDelivered</code>. The status field is used downstream
+    (unread filter, read-receipt analytics, dashboards) and it would
+    silently mislead consumers if "pushed to nobody" looked the same as
+    "successfully delivered". The row remains available via
+    <code>GetNotifications</code> for catch-up; when the user reconnects
+    they see it via the regular inbox flow.
+  </blockquote>
+
+  <h2>The wire shape</h2>
+  <p>
+    <code>StreamEvents</code> is a server-streaming RPC that multiplexes
+    three event kinds plus heartbeats over one connection:
+  </p>
+  <Code code={`message StreamEvent {
+  string session_id = 1;
+  oneof event {
+    NotificationEvent notification = 2;
+    DataChangeEvent   data_change  = 3;
+    HeartbeatEvent    heartbeat    = 4;
+  }
+}`} lang="proto" />
+
+  <ul>
+    <li><strong><code>notification</code></strong> — the platform delivered a new notification row to this user.</li>
+    <li><strong><code>data_change</code></strong> — an opaque "something upstream that you care about may have changed" hint. The client re-fetches via its own API. Carries an <code>idempotency_key</code> for at-least-once retry.</li>
+    <li><strong><code>heartbeat</code></strong> — keepalive carrying the server clock. First heartbeat after handshake carries the assigned <code>session_id</code> so the client can target <code>AckDataChange</code> at this exact stream.</li>
+  </ul>
+
+  <h2>Lifecycle</h2>
+  <ol>
+    <li>Client opens the stream with <code>Authorization: Bearer &lt;JWT&gt;</code> and a <code>DeviceType</code>.</li>
+    <li>Server authenticates, allocates a <code>Conn</code>, registers it under the user.</li>
+    <li>Server immediately sends one handshake <code>HeartbeatEvent</code> carrying the assigned <code>session_id</code>.</li>
+    <li>Server ticks heartbeats on <code>NOTIFY_LIVE_HEARTBEAT_INTERVAL</code> (default 30s); the in-app provider pushes notifications + data-change events as they arrive.</li>
+    <li>Client cancellation, network drop, or server shutdown ends the loop; the connection is unregistered before the handler returns.</li>
+  </ol>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_LIVE_CONNECTIONS_ENABLED=true   # default true
+-e NOTIFY_LIVE_HEARTBEAT_INTERVAL=30s
+-e NOTIFY_LIVE_RETRY_MAX_ATTEMPTS=3        # at-least-once budget for data-change events
+-e NOTIFY_LIVE_RETRY_INTERVAL=5s
+-e NOTIFY_ALLOWED_ORIGINS=https://app.example.com`} lang="bash" />
+
+  <p>
+    Setting <code>NOTIFY_LIVE_CONNECTIONS_ENABLED=false</code> disables
+    the subsystem entirely. <code>StreamEvents</code> returns
+    <code>CodeUnimplemented</code>, the in-app provider is not
+    registered, and in-app rows stay <code>StatusPending</code> for
+    inbox-only consumption.
+  </p>
+
+  <h2>Browser client (Connect-Web)</h2>
+  <Code code={`import { createConnectTransport } from "@connectrpc/connect-web";
+import { createClient } from "@connectrpc/connect";
+import { NotificationClientService } from "./gen/notify/v1/notify_pb";
+
+const transport = createConnectTransport({
+  baseUrl: "https://notify.example.com",
+  interceptors: [
+    (next) => async (req) => {
+      req.header.set("Authorization", \`Bearer \${getAccessToken()}\`);
+      return next(req);
+    },
+  ],
+});
+const client = createClient(NotificationClientService, transport);
+
+let sessionId = "";
+
+for await (const ev of client.streamEvents({ deviceType: "DEVICE_TYPE_BROWSER" })) {
+  sessionId = ev.sessionId || sessionId;
+
+  switch (ev.event.case) {
+    case "notification": {
+      const n = ev.event.value.notification!;
+      console.log("notification:", n.title, "—", n.body);
+      showInUI(n);
+      break;
+    }
+    case "dataChange": {
+      const dc = ev.event.value;
+      console.log("data change:", dc.subjectRef);
+      await refreshUpstream(dc.subjectRef);
+      // ACK so the server stops retrying.
+      await client.ackDataChange({
+        idempotencyKey: dc.idempotencyKey,
+        sessionId,
+      });
+      break;
+    }
+    case "heartbeat":
+      console.log("heartbeat @", ev.event.value.timestampMs);
+      break;
+  }
+}`} lang="ts" title="stream.ts" />
+
+  <h2>Reconnect strategy</h2>
+  <p>
+    Streams die for legitimate reasons: laptop sleep, server rolling
+    deploy, mobile carrier handover. The client should reconnect with
+    exponential backoff and a cap:
+  </p>
+  <Code code={`async function connectWithRetry() {
+  let backoffMs = 500;
+  const maxMs = 30_000;
+
+  for (;;) {
+    try {
+      // streamEvents() throws on any stream-level error.
+      for await (const ev of client.streamEvents({ deviceType: "DEVICE_TYPE_BROWSER" })) {
+        handle(ev);
+        backoffMs = 500; // reset on first successful event
+      }
+    } catch (err) {
+      console.warn("stream closed:", err);
+      await new Promise((r) => setTimeout(r, backoffMs + Math.random() * 250));
+      backoffMs = Math.min(backoffMs * 2, maxMs);
+    }
+  }
+}`} lang="ts" />
+
+  <p>
+    Reconnecting is safe: any in-flight events the client missed are
+    still in the store and available via
+    <code>GetNotifications</code>. Data-change events the client did not
+    ack will be retried by the server's <code>RetryTracker</code> until
+    either the ack arrives or
+    <code>NOTIFY_LIVE_RETRY_MAX_ATTEMPTS</code> is exhausted.
+  </p>
+
+  <h2>Sending an in-app notification</h2>
+  <p>
+    No address required — the in-app channel's destination is the user
+    id itself.
+  </p>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "task-42-comment-7",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_IN_APP"],
+    "subjectRef": "task:42",
+    "subjectType": "task",
+    "title": "New comment",
+    "body": "Bob commented on Task 42"
+  }'`} lang="bash" />
+
+  <h2>Backpressure</h2>
+  <p>
+    Each <code>Conn</code> has a buffered <code>EventCh</code> (default
+    64 deep). <code>Registry.Push</code> does a non-blocking send; a
+    connection whose buffer is full has the event dropped and logged
+    (<code>event_queue_full</code>). It stays registered for future
+    events — one slow client never blocks the producer or the rest of
+    the recipients.
+  </p>
+  <p>
+    The buffer size is currently fixed at
+    <code>DefaultEventBuffer = 64</code>. If a real client genuinely
+    needs deeper queueing, it's a follow-up wave; for now the right move
+    is to keep the client UI thread non-blocking on event arrival.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/realtime-engine">Realtime Engine</a> — Registry / RetryTracker internals</li>
+    <li><a href="/notify/docs/examples/subscribe-sse">Subscribe over SSE</a> — full client example with reconnect</li>
+    <li><a href="/notify/docs/examples/ack-notification">Ack a notification</a> — marking the row read</li>
+  </ul>
+</DocsLayout>

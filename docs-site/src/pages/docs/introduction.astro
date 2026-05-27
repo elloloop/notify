@@ -1,0 +1,116 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+---
+
+<DocsLayout title="What is notify">
+  <h1>What is notify</h1>
+  <p>
+    notify is a multi-channel notification platform packaged two ways:
+  </p>
+  <ul>
+    <li>
+      <strong>As a library</strong> — <code>import "github.com/elloloop/notify"</code>
+      and embed the orchestrator in-process. Inject a <code>Store</code> and
+      one or more <code>Provider</code>s; call <code>Notifier.Notify</code> with
+      a request.
+    </li>
+    <li>
+      <strong>As a container</strong> — <code>ghcr.io/elloloop/notify:&lt;version&gt;</code>,
+      a thin server wrapper that exposes the same orchestrator over gRPC
+      (for backend producers) and Connect/HTTP-2 (for browser + mobile
+      recipients).
+    </li>
+  </ul>
+  <p>
+    Both packaging modes share the same internals — the dual-mode pattern
+    is the same one <a href="https://github.com/elloloop/identity">elloloop/identity</a>
+    and <a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db</a>
+    use.
+  </p>
+
+  <h2>Design goals</h2>
+  <ul>
+    <li>
+      <strong>One image, deployed once per environment.</strong> A pinned
+      image tag plus a small set of <code>NOTIFY_*</code> env vars is the
+      whole deployment surface. No bespoke deploy pipelines.
+    </li>
+    <li>
+      <strong>Pluggable everywhere it matters.</strong> Channels and their
+      providers are wired by configuration, not code. The store is the same
+      story: memory · Postgres · EntDB drivers all satisfy one
+      <code>notify.Store</code> interface and run the same conformance
+      suite.
+    </li>
+    <li>
+      <strong>Domain-neutral.</strong> A <code>Notification</code> carries
+      an opaque <code>SubjectRef</code> + <code>SubjectType</code>. The
+      platform never interprets them — no <code>todo_id</code>,
+      <code>message_id</code> or any other consumer-specific fields leak
+      across the API.
+    </li>
+    <li>
+      <strong>Idempotent producer API.</strong> Every <code>Notify</code>
+      call is keyed by <code>(tenant_id, user_id, notification_id)</code>.
+      Retries are safe and never duplicate stored rows or provider
+      dispatches.
+    </li>
+    <li>
+      <strong>Per-recipient lifecycle.</strong> Delivery, ack, read
+      timestamps are stamped per user copy. Fan-out to N users produces N
+      rows with N independent lifecycles.
+    </li>
+  </ul>
+
+  <h2>What it is not</h2>
+  <ul>
+    <li>
+      <strong>Not a template engine.</strong> The platform delivers the
+      <code>Title</code> + <code>Body</code> + <code>Data</code> the caller
+      hands it. Localization, MJML rendering and HTML email composition are
+      the caller's concern (or a future wave).
+    </li>
+    <li>
+      <strong>Not an opinionated preferences system.</strong> Per-user
+      channel preferences ("Alice opted out of SMS") are explicitly out of
+      scope at v0.1; callers either skip channels themselves or store an
+      address of <code>""</code> to keep the row but suppress dispatch.
+    </li>
+    <li>
+      <strong>Not an OAuth IdP.</strong> Authentication is done elsewhere
+      (<a href="https://github.com/elloloop/identity">identity</a> in the
+      reference stack). notify validates the JWT it receives — it does not
+      issue tokens.
+    </li>
+    <li>
+      <strong>Not a polling endpoint masquerading as realtime.</strong> The
+      in-app channel uses a real server-streaming RPC (Connect/SSE). When
+      offline, in-app deliveries are <code>StatusPending</code> rather than
+      a lying <code>StatusDelivered</code>.
+    </li>
+  </ul>
+
+  <h2>Surface area</h2>
+  <p>
+    Two services live in the proto contract
+    (<a href="https://github.com/elloloop/notify/tree/main/proto/notify/v1">proto/notify/v1</a>):
+  </p>
+  <ul>
+    <li>
+      <code>NotificationInternalService.Notify</code> — the backend producer
+      RPC. Fan a payload out to one-or-many users across one-or-many
+      channels.
+    </li>
+    <li>
+      <code>NotificationClientService</code> — the client-facing surface
+      a browser SPA or mobile app calls. RPCs: <code>StreamEvents</code>,
+      <code>GetNotifications</code>, <code>AckNotification</code>,
+      <code>AckDataChange</code>, <code>RegisterPushToken</code>.
+    </li>
+  </ul>
+  <p>
+    Both are accessible via Connect-Go / Connect-Web / Connect-Python /
+    gRPC. There is no separate REST surface — Connect speaks JSON natively
+    over HTTP/1 and HTTP/2.
+  </p>
+</DocsLayout>
