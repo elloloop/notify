@@ -1,0 +1,185 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Email channel">
+  <h1>Email channel</h1>
+  <p>
+    The email channel delivers a notification as an outbound email. v0.1
+    ships one provider — <code>emailservice</code>, a thin translator over
+    a caller-supplied <code>Sender</code> interface — with slots for
+    <code>ses</code>, <code>acs</code>, <code>smtp</code>, and
+    <code>sendgrid</code> in later waves.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Any time a user needs an out-of-band message they will see whether or
+    not your app is open. Password resets, comment notifications, billing
+    receipts, weekly summaries — anything where the email is the
+    delivery rail itself, not a fallback hint.
+  </p>
+
+  <h2>Provider: emailservice</h2>
+  <p>
+    <code>emailservice</code> is intentionally small: it maps a
+    <code>notify.Message</code> onto a <code>SendEmailInput</code> and
+    hands it to a <code>Sender</code> the caller supplies. The
+    <code>Sender</code> contract is narrow on purpose so the provider
+    package never takes a dependency on any specific email proto.
+  </p>
+
+  <Code code={`// channels/email/emailservice/provider.go (verbatim)
+type Sender interface {
+    SendEmail(ctx context.Context, in SendEmailInput) (SendEmailOutput, error)
+}
+
+type SendEmailInput struct {
+    From     string
+    To       string
+    Subject  string
+    BodyText string
+    BodyHTML string
+}
+
+type SendEmailOutput struct {
+    MessageID string
+}`} lang="go" />
+
+  <p>Wire it like this in library mode:</p>
+  <Code code={`import (
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/channels/email/emailservice"
+)
+
+// 1. Implement Sender against whatever email transport you have.
+//    For elloloop/emailservice over Connect, wrap the generated client.
+type emailServiceClient struct{ /* generated client */ }
+
+func (c *emailServiceClient) SendEmail(ctx context.Context, in emailservice.SendEmailInput) (emailservice.SendEmailOutput, error) {
+    resp, err := c.client.SendEmail(ctx, connect.NewRequest(&emailpb.SendEmailRequest{
+        From:     in.From,
+        To:       in.To,
+        Subject:  in.Subject,
+        BodyText: in.BodyText,
+    }))
+    if err != nil {
+        return emailservice.SendEmailOutput{}, err
+    }
+    return emailservice.SendEmailOutput{MessageID: resp.Msg.GetMessageId()}, nil
+}
+
+// 2. Construct the provider.
+sender := &emailServiceClient{ /* ... */ }
+provider, err := emailservice.New("emailservice", sender, "noreply@example.com")
+if err != nil { /* config error: nil sender or empty from */ }
+
+registry := notify.NewProviderRegistry()
+registry.Register(provider)`} lang="go" />
+
+  <p>
+    The <code>Name</code> argument is the label that surfaces in
+    observability (<code>notify_send_total{`{provider="emailservice"}`}</code>).
+    Pass <code>""</code> to default to <code>"emailservice"</code>. For
+    an SES-backed Sender, pass <code>"ses"</code>; the channel kind
+    disambiguates.
+  </p>
+
+  <h2>Standalone container</h2>
+  <p>Set the provider block in env vars:</p>
+  <Code code={`-e NOTIFY_EMAIL_PROVIDER=emailservice \\
+-e NOTIFY_EMAIL_SERVICE_ADDRESS=emailservice.internal:50053 \\
+-e NOTIFY_EMAIL_FROM=noreply@example.com`} lang="bash" />
+
+  <p>
+    With <code>NOTIFY_EMAIL_PROVIDER=none</code> (the default) the channel
+    is disabled. Email rows in a <code>Notify</code> call are stored but
+    counted as <code>Pending</code> rather than dispatched.
+  </p>
+
+  <h2>Sending an email</h2>
+  <p>
+    Producer-side, every email send rides the standard
+    <code>Notify</code> RPC. The only additional thing the producer
+    supplies is the address.
+  </p>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "comment-7",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_EMAIL"],
+    "subjectRef": "task:42",
+    "subjectType": "task",
+    "title": "New comment",
+    "body": "Bob commented on Task 42",
+    "addresses": {
+      "user-alice": {
+        "byChannel": {
+          "email": "alice@example.com"
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <p>
+    Response on a successful send:
+  </p>
+  <Code code={`{"delivered": 1, "pending": 0, "failed": 0}`} lang="json" />
+
+  <h2>Title vs Body mapping</h2>
+  <p>
+    The provider maps the notify fields straight through:
+  </p>
+  <ul>
+    <li><code>From</code> = the provider's configured default From address.</li>
+    <li><code>To</code> = <code>Message.To</code>.</li>
+    <li><code>Subject</code> = <code>Title</code>.</li>
+    <li><code>BodyText</code> = <code>Body</code>.</li>
+    <li><code>BodyHTML</code> = <code>""</code>. (HTML rendering is the Sender's concern; wrap the Sender with a template step if you need it.)</li>
+  </ul>
+
+  <h2>Receipts and error handling</h2>
+  <p>
+    On success, <code>Provider.Send</code> returns a
+    <code>Receipt{`{ProviderMessageID, StatusDelivered}`}</code> populated
+    with the Sender's <code>MessageID</code>. The orchestrator persists
+    <code>StatusDelivered</code> on the row and stamps
+    <code>DeliveredAtMS</code>.
+  </p>
+  <p>
+    On error, the receipt is <code>StatusFailed</code> and the error is
+    wrapped with <code>%w</code> so the caller can
+    <code>errors.Is</code> / <code>errors.As</code> against the
+    underlying transport error.
+  </p>
+  <p>
+    Empty <code>Message.To</code> short-circuits with
+    <code>StatusFailed</code> — every email transport rejects an empty
+    recipient and the platform avoids a wasted RPC.
+  </p>
+
+  <h2>Future providers</h2>
+  <ul>
+    <li><strong>SES</strong> — direct AWS SDK integration.</li>
+    <li><strong>ACS</strong> — Azure Communication Services Email.</li>
+    <li><strong>SMTP</strong> — direct submission to an MX or relay.</li>
+    <li><strong>SendGrid</strong> — REST API.</li>
+  </ul>
+  <p>
+    All four slot into the same <code>ChannelEmail</code> registry entry
+    via different <code>Sender</code> implementations. None of them
+    require changes to <code>notify.Notifier</code>; the contract
+    stops at the provider boundary.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a></li>
+    <li><a href="/notify/docs/examples/send-notification">Send a notification</a> — Go / Python / cURL</li>
+    <li><a href="/notify/docs/api-reference/grpc">API Reference</a> — Notify RPC</li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,185 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="GitHub Actions release pipeline">
+  <h1>GitHub Actions release pipeline</h1>
+  <p>
+    notify publishes container images via
+    <code>.github/workflows/release.yml</code>. A push to any
+    <code>v*</code> tag triggers test → docker-smoke → build-and-push →
+    cosign sign → Trivy scan → proto bundle release. The exact same
+    workflow is also <code>workflow_dispatch</code>-triggerable for
+    one-off rebuilds.
+  </p>
+
+  <h2>When you'd care</h2>
+  <ul>
+    <li>You're cutting a release.</li>
+    <li>You're debugging a failed publish run.</li>
+    <li>You want to mirror the same pipeline for an internal fork.</li>
+  </ul>
+
+  <h2>Trigger shape</h2>
+  <Code code={`on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build (defaults to current ref).
+        required: false`} lang="yaml" />
+
+  <h2>Job graph</h2>
+  <Code code={`test ──► docker-smoke ──► build-and-push ──► scan-image
+                                       └──► release-protos  (only on tag pushes)`} lang="text" />
+
+  <h3>1. test</h3>
+  <p>
+    Re-runs every gate that PRs run. Plain
+    <code>go build ./...</code> + <code>go vet ./...</code> +
+    <code>go test -race</code> over everything except the
+    driver-specific tree. A broken build must not publish.
+  </p>
+
+  <h3>2. docker-smoke</h3>
+  <p>
+    Builds the <code>server</code> target locally
+    (<code>docker buildx build --load</code>), runs the container with
+    <code>NOTIFY_AUTH_DEV_MODE=true</code> +
+    <code>NOTIFY_STORE_DRIVER=memory</code>, and curls
+    <code>/healthz</code> until it sees
+    <code>{`{"status":"ok"}`}</code>. Fails the run if the container
+    crashes during boot.
+  </p>
+
+  <Code code={`docker run -d \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  -p 127.0.0.1:19090:9090 \\
+  notify:release-smoke
+
+for i in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:19090/healthz > /tmp/notify-health.json; then
+    grep -q '"status":"ok"' /tmp/notify-health.json
+    exit 0
+  fi
+  sleep 1
+done
+docker logs "$cid"
+exit 1`} lang="bash" title="docker-smoke (abridged)" />
+
+  <h3>3. build-and-push</h3>
+  <p>
+    Cross-builds for <code>linux/amd64</code> + <code>linux/arm64</code>
+    via <code>docker/setup-qemu-action</code> +
+    <code>docker/setup-buildx-action</code>, then publishes to
+    <code>ghcr.io/elloloop/notify</code> tagged from
+    <code>docker/metadata-action</code> — semver components, branch
+    name, sha, and <code>latest</code> on a tag push.
+  </p>
+  <p>
+    Permissions are scoped: <code>contents: read</code>,
+    <code>packages: write</code> (to push to ghcr),
+    <code>id-token: write</code> (for cosign keyless OIDC).
+  </p>
+
+  <Code code={`- name: Sign published image (keyless OIDC)
+  env:
+    DIGEST: \${{ steps.build.outputs.digest }}
+    TAGS: \${{ steps.meta.outputs.tags }}
+  run: |
+    for tag in $TAGS; do
+      cosign sign --yes "\${tag}@\${DIGEST}"
+    done`} lang="yaml" />
+
+  <h3>4. scan-image</h3>
+  <p>
+    Post-publish, Trivy is pinned by SHA (defending against the
+    March 2026 advisory) and scans the published image. HIGH and
+    CRITICAL CVEs cause the workflow to fail; results are uploaded as
+    SARIF to GitHub Code Scanning.
+  </p>
+
+  <Code code={`- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+  with:
+    image-ref: \${{ steps.tag.outputs.image }}
+    format: sarif
+    output: trivy-results.sarif
+    severity: CRITICAL,HIGH
+    ignore-unfixed: true
+    exit-code: '1'`} lang="yaml" />
+
+  <h3>5. release-protos</h3>
+  <p>
+    On a tag push only. Packs the <code>proto/</code> tree plus
+    <code>buf.yaml</code> + <code>buf.gen.yaml</code> into a tarball +
+    zip + sha256 file and attaches them to the GitHub Release. Consumers
+    who don't want to vendor a git ref can pin against the proto
+    bundle for the exact version.
+  </p>
+
+  <Code code={`gh release create "$VERSION" \\
+  --title "$VERSION" \\
+  --notes-file "$notes_file" \\
+  "dist/notify-protos-\${VER}.tar.gz" \\
+  "dist/notify-protos-\${VER}.zip" \\
+  "dist/notify-protos-\${VER}.sha256"`} lang="bash" />
+
+  <h2>Cutting a release</h2>
+  <ol>
+    <li>Update <code>VERSION</code> (or rely on the workflow's "Inject version from git tag" step).</li>
+    <li>Open and merge a PR with the changelog entry / version bump.</li>
+    <li>From <code>main</code>: <code>git tag v0.1.0 && git push origin v0.1.0</code>.</li>
+    <li>Workflow runs end-to-end: test → smoke → push → cosign → Trivy → proto bundle.</li>
+    <li>The published image is reachable at <code>ghcr.io/elloloop/notify:0.1.0</code>.</li>
+  </ol>
+
+  <h2>Conformance workflow (PR gate)</h2>
+  <p>
+    <code>.github/workflows/conformance.yml</code> is the PR-side gate.
+    It runs:
+  </p>
+  <ul>
+    <li>A <strong>Unit</strong> job — <code>go build / vet / test -race</code> over everything except the driver-specific tree.</li>
+    <li>A <strong>Conformance / &lt;driver&gt;</strong> matrix — <code>memory</code>, <code>postgres</code> (via the <code>postgres:16.13-alpine3.23</code> service container), <code>entdb</code> (via <code>ghcr.io/elloloop/tenant-shard-db:2.0.5</code> service container with the <code>realentdb</code> build tag).</li>
+  </ul>
+
+  <p>
+    Branch protection pins the <code>Conformance / memory</code>,
+    <code>Conformance / postgres</code>, <code>Conformance / entdb</code>,
+    and <code>Unit</code> checks. Nothing lands without all four green.
+  </p>
+
+  <h2>Local equivalent</h2>
+  <Code code={`# Run the same gates the workflows run.
+go build ./...
+go vet ./...
+go test -race -count=1 -timeout=600s \\
+  $(go list ./... | grep -vE '/(store/(postgres|entdb))(/|$)')
+
+# Per-driver conformance.
+go test ./store/memory/... -race -count=1 -v
+go test ./store/postgres/... -race -count=1 -v                     # needs Docker for testcontainers
+NOTIFY_ENTDB_ADDRESS=localhost:50051 \\
+  go test -tags=realentdb ./store/entdb/... -race -count=1 -v      # needs entdb at that addr
+
+# Build + smoke the container locally.
+docker build -t notify:dev .
+docker run --rm -d --name notify-smoke \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  -p 19090:9090 notify:dev
+curl -fsS http://127.0.0.1:19090/healthz
+docker rm -f notify-smoke`} lang="bash" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/deployment/docker">Deployment: Docker</a></li>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a></li>
+    <li><a href="https://github.com/elloloop/notify/blob/main/.github/workflows/release.yml">release.yml on GitHub</a></li>
+    <li><a href="https://github.com/elloloop/notify/blob/main/.github/workflows/conformance.yml">conformance.yml on GitHub</a></li>
+  </ul>
+</DocsLayout>

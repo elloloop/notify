@@ -1,0 +1,205 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Store Setup">
+  <h1>Store Setup</h1>
+  <p>
+    Pick the durable store driver that fits the deployment. Memory is the
+    test/dev reference; Postgres is the typical production shape;
+    EntDB is the right call if you already run tenant-shard-db.
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    You are sizing storage for a new environment, deciding which managed
+    Postgres SKU to provision, or wiring notify into an existing EntDB
+    cluster.
+  </p>
+
+  <h2>memory (default)</h2>
+  <p>
+    No setup. <code>NOTIFY_STORE_DRIVER=memory</code> is the default;
+    everything lives in process memory and disappears on restart.
+  </p>
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  ghcr.io/elloloop/notify:latest`} lang="bash" />
+
+  <p>
+    Use this for tests, demos, and CI fixtures. It is the conformance
+    reference — every other driver is verified against memory's
+    behaviour.
+  </p>
+
+  <h2>postgres</h2>
+  <p>
+    Use a managed Postgres 14+ (we test against
+    <code>postgres:16.13-alpine3.23</code>). Auto-migration is on by
+    default and applies the schema under
+    <code>pg_advisory_lock</code> so concurrent boots serialise.
+  </p>
+
+  <h3>Provisioning a database</h3>
+  <Code code={`# Anything that can run CREATE DATABASE / CREATE USER.
+CREATE USER notify WITH PASSWORD 'notify';
+CREATE DATABASE notify OWNER notify;
+GRANT ALL PRIVILEGES ON DATABASE notify TO notify;`} lang="sql" />
+
+  <h3>Wiring it in</h3>
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_STORE_DRIVER=postgres \\
+  -e NOTIFY_POSTGRES_DSN='postgres://notify:notify@db.internal:5432/notify?sslmode=require' \\
+  -e NOTIFY_POSTGRES_AUTOMIGRATE=true \\
+  -e NOTIFY_AUTH_JWT_SECRET=$(openssl rand -hex 32) \\
+  -e NOTIFY_INTERNAL_TOKEN=$(openssl rand -hex 32) \\
+  ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <h3>What auto-migrate does</h3>
+  <p>
+    On first boot it creates <code>notify_notifications</code>,
+    <code>notify_devices</code> and the
+    <code>notify_schema_migrations</code> bookkeeping table. Subsequent
+    boots see the ledger and skip already-applied versions.
+  </p>
+  <Code code={`CREATE TABLE notify_notifications (
+    id              uuid PRIMARY KEY,
+    tenant_id       text   NOT NULL,
+    user_id         text   NOT NULL,
+    notification_id text   NOT NULL,
+    subject_ref     text   NOT NULL DEFAULT '',
+    subject_type    text   NOT NULL DEFAULT '',
+    title           text   NOT NULL DEFAULT '',
+    body            text   NOT NULL DEFAULT '',
+    channel         text   NOT NULL DEFAULT '',
+    status          text   NOT NULL,
+    created_at_ms   bigint NOT NULL,
+    delivered_at_ms bigint NOT NULL DEFAULT 0,
+    ack_at_ms       bigint NOT NULL DEFAULT 0,
+    read_at_ms      bigint NOT NULL DEFAULT 0,
+    UNIQUE (tenant_id, user_id, notification_id)
+);
+
+CREATE INDEX notify_notifications_user_created
+  ON notify_notifications (tenant_id, user_id, created_at_ms DESC, id DESC);
+
+CREATE INDEX notify_notifications_user_unread
+  ON notify_notifications (tenant_id, user_id)
+  WHERE status <> 'read';
+
+CREATE TABLE notify_devices (
+    id             uuid PRIMARY KEY,
+    tenant_id      text   NOT NULL,
+    user_id        text   NOT NULL,
+    device_type    text   NOT NULL,
+    token          text   NOT NULL DEFAULT '',
+    created_at_ms  bigint NOT NULL DEFAULT 0,
+    last_active_ms bigint NOT NULL DEFAULT 0,
+    UNIQUE (tenant_id, user_id, device_type)
+);`} lang="sql" title="migration 1 — init" />
+
+  <p>
+    If you want to manage migrations out of band (a CI step, golang-migrate,
+    etc.) set <code>NOTIFY_POSTGRES_AUTOMIGRATE=false</code>. The schema
+    is two tables plus three indexes — easy to mirror verbatim.
+  </p>
+
+  <h3>Sizing</h3>
+  <p>
+    Reasonable defaults: <code>MaxConns = 25</code>,
+    <code>MaxConnLifetime = 1h</code>, <code>MaxConnIdleTime = 30m</code> —
+    cooperative with pgbouncer / Azure idle reapers. notify is read-heavy
+    on the inbox surface and append-heavy on Notify; the
+    <code>notify_notifications_user_unread</code> partial index keeps
+    unread counts fast even with millions of read rows.
+  </p>
+
+  <h3>Conformance</h3>
+  <p>
+    The Postgres driver is verified at <strong>24/24</strong> against the
+    shared suite. See <a href="/notify/docs/store/postgres">Postgres driver</a>
+    or the
+    <a href="https://github.com/elloloop/notify/blob/main/store/postgres/CONFORMANCE.md">CONFORMANCE.md</a>
+    for the per-subtest table and the design rationale.
+  </p>
+
+  <h2>entdb (tenant-shard-db)</h2>
+  <p>
+    Use this when EntDB is already a primitive in your stack
+    (e.g. you run identity against it). The notify driver requires the
+    v2 schema-aware mode (ADR-031) — v1.32.1 cannot enforce the
+    composite-uniqueness constraint that idempotent
+    <code>CreateNotification</code> needs.
+  </p>
+
+  <h3>Boot a local EntDB</h3>
+  <Code code={`docker run -d --rm --name notify-entdb -p 50051:50051 \\
+  ghcr.io/elloloop/tenant-shard-db:2.0.5 \\
+  -addr=:50051 -data-dir=/tmp/entdb -wal-backend=memory`} lang="bash" />
+
+  <p>
+    <code>-data-dir</code> is required on v2 (it was implicit in v1.32.1
+    and earlier).
+  </p>
+
+  <h3>Wiring it in</h3>
+  <Code code={`docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_STORE_DRIVER=entdb \\
+  -e NOTIFY_ENTDB_ADDRESS=entdb.internal:50051 \\
+  -e NOTIFY_ENTDB_TENANT_ID=notify-prod \\
+  -e NOTIFY_AUTH_JWT_SECRET=$(openssl rand -hex 32) \\
+  -e NOTIFY_INTERNAL_TOKEN=$(openssl rand -hex 32) \\
+  ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <h3>Schema-aware mode</h3>
+  <p>
+    notify's <code>cmd/notifyd</code> registers the schema on the SDK
+    client at boot:
+  </p>
+  <Code code={`client, err := sdk.NewClient(
+    cfg.Store.EntDBAddress,
+    sdk.WithSchema(entdb.SchemaMessages()...),
+)`} lang="go" />
+
+  <p>
+    <code>entdb.SchemaMessages()</code> returns the two proto descriptors
+    (<code>UserNotification</code>, <code>DeviceRegistration</code>) declared
+    in <code>proto/entdb_notify/notify.proto</code>. The v2 server
+    materializes the schema from those descriptors on the first
+    <code>ExecuteAtomic</code> and enforces <code>unique: true</code> on
+    the <code>composite_key</code> field — which closes the
+    concurrent-create race the conformance suite probes.
+  </p>
+
+  <h3>Sharding</h3>
+  <p>
+    One notify container talks to one EntDB tenant shard
+    (<code>NOTIFY_ENTDB_TENANT_ID</code>). All notify-application tenants
+    live under that one storage shard, differentiated by the
+    <code>tenant_id</code> row field. If a large customer needs its own
+    storage shard, run a second notify container pointed at a different
+    <code>NOTIFY_ENTDB_TENANT_ID</code>.
+  </p>
+
+  <h3>Conformance</h3>
+  <p>
+    EntDB driver passes <strong>24/24</strong> on v2.0.5; the two
+    formerly-red canaries (composite uniqueness under concurrent create
+    + device upsert) flipped to green when the schema-aware enforcement
+    landed in v2.0.1. See
+    <a href="/notify/docs/store/entdb">EntDB driver</a> or
+    <a href="https://github.com/elloloop/notify/blob/main/store/entdb/CONFORMANCE.md">store/entdb/CONFORMANCE.md</a>.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a></li>
+    <li><a href="/notify/docs/store/memory">Memory driver</a></li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a></li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a></li>
+  </ul>
+</DocsLayout>

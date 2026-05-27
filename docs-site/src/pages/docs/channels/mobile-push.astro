@@ -1,0 +1,211 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Mobile push channel">
+  <h1>Mobile push channel</h1>
+  <p>
+    Mobile push delivers notifications to a native Android or iOS app via
+    Firebase Cloud Messaging (HTTP v1). v0.1 ships the FCM provider;
+    APNs / Azure / AWS slot into the same <code>ChannelMobilePush</code>
+    registry entry in later waves.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Anything you'd want to push to a native app whose process isn't
+    currently running. Chat messages, calendar reminders, system
+    alerts, anything that needs the OS notification surface.
+  </p>
+
+  <h2>Provider: FCM HTTP v1</h2>
+  <p>
+    The provider is a ~150-line hand-rolled HTTP v1 client — we
+    deliberately do not use the Firebase Admin SDK because v1 send is
+    one POST and JWT auth is a single call into
+    <code>golang.org/x/oauth2/google</code>; the Admin SDK's transitive
+    closure isn't worth it for the surface notify exercises.
+  </p>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_MOBILEPUSH_PROVIDER=fcm \\
+-e NOTIFY_FCM_PROJECT_ID=my-firebase-project \\
+-e NOTIFY_FCM_CREDENTIALS_JSON="$(cat ./service-account.json)"`} lang="bash" />
+
+  <p>
+    The provider parses the service-account JSON eagerly during
+    <code>fcm.New</code>, so a malformed credential blob fails at
+    construction — not on first send. The OAuth2 token source is built
+    once and reused across sends.
+  </p>
+
+  <h2>Library wiring</h2>
+  <Code code={`import (
+    "os"
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/channels/fcm"
+)
+
+provider, err := fcm.New(notify.MobilePushConfig{
+    FCMProjectID:       "my-firebase-project",
+    FCMCredentialsJSON: os.Getenv("FCM_SERVICE_ACCOUNT_JSON"),
+})
+if err != nil { /* invalid credentials or missing project id */ }
+
+registry := notify.NewProviderRegistry()
+registry.Register(provider)`} lang="go" />
+
+  <h2>Android — registering an FCM token</h2>
+  <Code code={`// Kotlin
+import com.google.firebase.messaging.FirebaseMessaging
+
+FirebaseMessaging.getInstance().token
+    .addOnCompleteListener(OnCompleteListener { task ->
+        if (!task.isSuccessful) {
+            Log.w("notify", "Fetching FCM registration token failed", task.exception)
+            return@OnCompleteListener
+        }
+        val token = task.result
+        // Send token to notify.
+        notifyApi.registerPushToken(
+            RegisterPushTokenRequest(
+                deviceType = DeviceType.DEVICE_TYPE_ANDROID,
+                token = token,
+            )
+        )
+    })`} lang="kotlin" />
+
+  <h2>iOS — registering an FCM token</h2>
+  <Code code={`// Swift
+import FirebaseMessaging
+
+Messaging.messaging().token { token, error in
+    guard let token = token, error == nil else {
+        print("Error fetching FCM token: \\(error?.localizedDescription ?? "")")
+        return
+    }
+    notifyApi.registerPushToken(
+        deviceType: .ios,
+        token: token,
+    )
+}`} lang="swift" />
+
+  <p>
+    Apple Push Notification service (APNs) sits under FCM here — your
+    Xcode project registers for remote notifications and Firebase
+    surfaces an FCM token. notify treats it as one address, regardless
+    of upstream pipeline.
+  </p>
+
+  <h2>Sending a mobile push</h2>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "msg-9001",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_MOBILE_PUSH"],
+    "title": "Bob",
+    "body": "Are you around?",
+    "addresses": {
+      "user-alice": {
+        "byChannel": {
+          "mobile_push": "fzM-zR...:APA91bH..."
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <h2>Wire payload</h2>
+  <p>The provider posts this body to <code>/v1/projects/$PROJECT/messages:send</code>:</p>
+  <Code code={`{
+  "message": {
+    "token": "fzM-zR...:APA91bH...",
+    "notification": {
+      "title": "Bob",
+      "body": "Are you around?"
+    },
+    "data": {
+      "deep_link": "/chats/9001"
+    }
+  }
+}`} lang="json" />
+
+  <p>
+    The <code>data</code> map comes from <code>Message.Data</code>; it is
+    delivered to your client as a flat string-to-string map alongside
+    the notification.
+  </p>
+
+  <h2>Handling ErrUnregisteredToken</h2>
+  <p>
+    FCM signals "this device token is no longer valid" two ways:
+    <code>HTTP 404</code> + <code>status: NOT_FOUND</code>, or any
+    response with <code>details[].errorCode == "UNREGISTERED"</code>.
+    The provider folds both into <code>ErrUnregisteredToken</code>:
+  </p>
+  <Code code={`import "github.com/elloloop/notify/channels/fcm"
+
+receipt, err := provider.Send(ctx, msg)
+if err != nil {
+    if errors.Is(err, fcm.ErrUnregisteredToken) {
+        // Purge the device row in your store.
+        deviceStore.Delete(ctx, msg.Notification.TenantID, msg.Notification.UserID, "android")
+    } else {
+        log.Warn("fcm_send_failed", "err", err)
+    }
+}`} lang="go" />
+
+  <p>
+    The provider itself never auto-purges. See
+    <a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a>
+    for the rationale.
+  </p>
+
+  <h2>Testing without hitting FCM</h2>
+  <p>
+    Both the HTTP client and the OAuth2 token source are injectable via
+    constructor options. Tests use an <code>httptest.Server</code> and a
+    static-token <code>oauth2.TokenSource</code> so they never reach
+    google.com:
+  </p>
+  <Code code={`srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    var body fcmMessage
+    _ = json.NewDecoder(r.Body).Decode(&body)
+    if body.Message.Token != "test-token" { t.Fatalf("token = %q", body.Message.Token) }
+    w.Header().Set("Content-Type", "application/json")
+    _, _ = w.Write([]byte(\`{"name":"projects/p/messages/100"}\`))
+}))
+defer srv.Close()
+
+p, _ := fcm.New(
+    notify.MobilePushConfig{FCMProjectID: "p", FCMCredentialsJSON: minimalServiceAccountJSON},
+    fcm.WithHTTPClient(srv.Client()),
+    fcm.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "fake"})),
+)
+p.SetBaseURL(srv.URL)
+
+receipt, err := p.Send(context.Background(), notify.Message{To: "test-token", Title: "hi", Body: "there"})`} lang="go" />
+
+  <h2>Receipts</h2>
+  <p>
+    On success the receipt carries the FCM message name (e.g.
+    <code>projects/my-project/messages/100</code>) as
+    <code>ProviderMessageID</code> and <code>StatusDelivered</code>.
+  </p>
+
+  <h2>Future providers</h2>
+  <ul>
+    <li><strong>APNs direct</strong> — bypass FCM for iOS, P8 JWT auth.</li>
+    <li><strong>Azure Notification Hubs</strong>.</li>
+    <li><strong>AWS SNS Mobile Push</strong>.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/web-push">Web Push channel</a></li>
+    <li><a href="/notify/docs/examples/register-push-token">Register a push token</a></li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,146 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Graceful Shutdown">
+  <h1>Graceful Shutdown</h1>
+  <p>
+    <code>Server.Run</code> traps <code>SIGINT</code> and
+    <code>SIGTERM</code>, marks the health endpoint not-ready, and runs
+    a single ordered <code>Shutdown</code> against the three HTTP
+    servers, the retry tracker, and the store. The total time is
+    capped by <code>NOTIFY_SHUTDOWN_TIMEOUT</code> (default <code>30s</code>).
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    Tuning a rolling deploy, debugging requests cut off mid-flight, or
+    sizing a Kubernetes <code>terminationGracePeriodSeconds</code>.
+  </p>
+
+  <h2>The shutdown sequence</h2>
+  <ol>
+    <li><code>Server.health.markNotReady()</code> — <code>/healthz</code> immediately starts returning <code>503</code> with <code>not_ready</code>. Kubernetes readiness probes stop steering traffic to the pod within one probe interval (default ~5s).</li>
+    <li><code>http.Server.Shutdown</code> is called on the client server, the internal server, and the metrics server in turn. Each waits for in-flight handlers to return; new connections are rejected.</li>
+    <li><code>RetryTracker.CancelAll</code> cancels every in-flight at-least-once retry so no goroutine leaks across the process exit.</li>
+    <li>The store closer is invoked (<code>pgx.Pool.Close</code> for Postgres, <code>sdk.Client.Close</code> for EntDB, no-op for memory). This is the last step so any in-flight handler that's still touching the store has time to return first.</li>
+  </ol>
+
+  <Code code={`func (s *Server) Shutdown(ctx context.Context) error {
+    s.health.markNotReady()
+    ctx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
+    defer cancel()
+
+    var firstErr error
+    for _, srv := range []*http.Server{s.clientServer, s.internalSrv, s.metricsSrv} {
+        if err := srv.Shutdown(ctx); err != nil && firstErr == nil {
+            firstErr = err
+        }
+    }
+    if s.retries != nil {
+        s.retries.CancelAll()
+    }
+    if s.closer != nil {
+        if err := s.closer.Close(); err != nil && firstErr == nil {
+            firstErr = err
+        }
+    }
+    return firstErr
+}`} lang="go" />
+
+  <h2>Picking a timeout</h2>
+  <p>
+    The default 30s is a reasonable starting point. Two workloads should
+    bump it:
+  </p>
+  <ul>
+    <li><strong>Many open streams</strong> — every active <code>StreamEvents</code> connection must drain. The handler exits cleanly on context cancel, but a TCP close handshake takes a few hundred ms times N connections. For 10k open streams plan ~60s.</li>
+    <li><strong>Slow provider Send in flight</strong> — if you registered a provider that talks to a slow backend without its own timeout, <code>NotificationInternalService.Notify</code> calls may need ~10s+ each. Set <code>NOTIFY_SHUTDOWN_TIMEOUT</code> a comfortable margin above the longest acceptable provider latency.</li>
+  </ul>
+
+  <Code code={`-e NOTIFY_SHUTDOWN_TIMEOUT=60s`} lang="bash" />
+
+  <h2>Kubernetes terminationGracePeriodSeconds</h2>
+  <p>
+    Set it slightly longer than <code>NOTIFY_SHUTDOWN_TIMEOUT</code> so
+    the kubelet doesn't SIGKILL before notify finishes draining:
+  </p>
+  <Code code={`spec:
+  terminationGracePeriodSeconds: 45      # NOTIFY_SHUTDOWN_TIMEOUT + headroom
+  containers:
+    - name: notify
+      env:
+        - { name: NOTIFY_SHUTDOWN_TIMEOUT, value: "30s" }`} lang="yaml" />
+
+  <h2>preStop hook (defensive)</h2>
+  <p>
+    Optional: a short preStop hook gives the load balancer / service
+    mesh time to stop sending new traffic before notify even sees SIGTERM:
+  </p>
+  <Code code={`lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 5"]`} lang="yaml" />
+
+  <p>
+    The container ships <code>FROM scratch</code> so there's no
+    <code>/bin/sh</code>; if you want a preStop sleep, project a
+    sidecar with a shell, or rely on the readiness-probe flip to drain
+    upstream proxies inside <code>Server.Shutdown</code> itself.
+  </p>
+
+  <h2>Retry-tracker drain semantics</h2>
+  <p>
+    The at-least-once <code>RetryTracker</code> spawns one goroutine per
+    <code>(key, connID)</code> pair when a data-change event is
+    scheduled. <code>CancelAll</code> cancels every parent context and
+    drains the map. After shutdown:
+  </p>
+  <ul>
+    <li>No goroutines are leaked — every retry loop exits via <code>&lt;-ctx.Done()</code>.</li>
+    <li>Any unacked data-change event whose retry budget was not yet exhausted is silently dropped. <strong>This is by design</strong>: data-change events are best-effort hints. A reconnecting client re-fetches state via its own API, so a missed hint is at worst one extra cold fetch.</li>
+  </ul>
+  <p>
+    If you need at-least-once delivery across pod restarts for a
+    specific use case, push it through a durable channel (email, SMS,
+    web push, mobile push) — the in-app channel is real-time-or-nothing
+    by intent.
+  </p>
+
+  <h2>Store closure</h2>
+  <ul>
+    <li><strong>memory</strong> — no Close, no-op.</li>
+    <li><strong>postgres</strong> — <code>pgxpool.Pool.Close</code>; waits for all checked-out connections to be returned before closing.</li>
+    <li><strong>entdb</strong> — <code>sdk.Client.Close</code>; closes the gRPC transport.</li>
+  </ul>
+
+  <p>
+    The store close runs <strong>after</strong> the HTTP servers have
+    finished draining. This guarantees no in-flight Connect handler is
+    still touching the store when its connections get torn down —
+    avoiding spurious "connection closed" errors in the very last log
+    lines.
+  </p>
+
+  <h2>Observability during shutdown</h2>
+  <Code code={`{"time":"...","level":"INFO","msg":"server_shutdown_signal"}
+{"time":"...","level":"INFO","msg":"stream_close","connection_id":"...","user_id":"..."}  // one per stream
+{"time":"...","level":"INFO","msg":"stream_close","connection_id":"...","user_id":"..."}
+... (per in-flight stream) ...
+{"time":"...","level":"WARN","msg":"server_shutdown_error","error":"..."}  // only on failure`} lang="json" />
+
+  <p>
+    If the shutdown completes within <code>NOTIFY_SHUTDOWN_TIMEOUT</code>,
+    the process exits with status 0. If the timeout fires first the
+    process logs <code>server_shutdown_error</code> with the underlying
+    cause and exits with the first non-nil error.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/operations/observability">Observability</a></li>
+    <li><a href="/notify/docs/deployment/kubernetes">Kubernetes deployment</a></li>
+    <li><a href="/notify/docs/concepts/realtime-engine">Realtime engine</a> — RetryTracker invariants</li>
+  </ul>
+</DocsLayout>

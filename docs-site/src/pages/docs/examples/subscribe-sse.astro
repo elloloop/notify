@@ -1,0 +1,228 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Example — Subscribe over SSE">
+  <h1>Subscribe over SSE</h1>
+  <p>
+    Open a long-lived stream of new notifications, data-change hints,
+    and heartbeats from a browser or mobile client. The platform speaks
+    Connect over HTTP/2; <code>StreamEvents</code> is a server-streaming
+    RPC, so it works equally over plain SSE-style framing.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Any client surface that wants real-time updates: a web SPA showing
+    chat messages without a refresh, a mobile app updating a task list
+    while the user has it open, a desktop tray app surfacing system
+    notifications.
+  </p>
+
+  <h2>Recipe — browser (Connect-Web)</h2>
+  <Code code={`// shared/notify-client.ts
+import { createConnectTransport } from "@connectrpc/connect-web";
+import { createClient } from "@connectrpc/connect";
+import { NotificationClientService } from "./gen/notify/v1/notify_pb";
+
+export function buildNotifyClient(baseUrl: string, getToken: () => Promise<string>) {
+  const transport = createConnectTransport({
+    baseUrl,
+    interceptors: [
+      (next) => async (req) => {
+        const token = await getToken();
+        req.header.set("Authorization", \`Bearer \${token}\`);
+        return next(req);
+      },
+    ],
+  });
+  return createClient(NotificationClientService, transport);
+}`} lang="ts" title="shared/notify-client.ts" />
+
+  <Code code={`// features/notifications/stream.ts
+import { buildNotifyClient } from "../../shared/notify-client";
+
+type NotifyEvent =
+  | { kind: "notification"; id: string; title: string; body: string; subjectRef: string }
+  | { kind: "dataChange"; idempotencyKey: string; subjectRef: string; subjectType: string }
+  | { kind: "heartbeat"; timestampMs: bigint };
+
+export interface Stream {
+  cancel(): void;
+  sessionId(): string;
+}
+
+export function openStream(opts: {
+  baseUrl: string;
+  getToken: () => Promise<string>;
+  onEvent: (ev: NotifyEvent) => void;
+  onError?: (err: unknown) => void;
+}): Stream {
+  const client = buildNotifyClient(opts.baseUrl, opts.getToken);
+  const abort = new AbortController();
+  let currentSession = "";
+
+  void (async () => {
+    let backoffMs = 500;
+    const maxMs = 30_000;
+
+    while (!abort.signal.aborted) {
+      try {
+        const it = client.streamEvents(
+          { deviceType: "DEVICE_TYPE_BROWSER" },
+          { signal: abort.signal },
+        );
+        for await (const ev of it) {
+          currentSession = ev.sessionId || currentSession;
+          backoffMs = 500; // reset on the first received event
+
+          switch (ev.event.case) {
+            case "notification": {
+              const n = ev.event.value.notification!;
+              opts.onEvent({
+                kind: "notification",
+                id: n.id,
+                title: n.title,
+                body: n.body,
+                subjectRef: n.subjectRef,
+              });
+              break;
+            }
+            case "dataChange": {
+              const dc = ev.event.value;
+              opts.onEvent({
+                kind: "dataChange",
+                idempotencyKey: dc.idempotencyKey,
+                subjectRef: dc.subjectRef,
+                subjectType: dc.subjectType,
+              });
+              // Ack so the server stops retrying.
+              await client.ackDataChange({
+                idempotencyKey: dc.idempotencyKey,
+                sessionId: currentSession,
+              });
+              break;
+            }
+            case "heartbeat":
+              opts.onEvent({
+                kind: "heartbeat",
+                timestampMs: ev.event.value.timestampMs,
+              });
+              break;
+          }
+        }
+      } catch (err) {
+        if (abort.signal.aborted) return;
+        opts.onError?.(err);
+        // Exponential backoff with jitter and a cap.
+        await new Promise((r) => setTimeout(r, backoffMs + Math.random() * 250));
+        backoffMs = Math.min(backoffMs * 2, maxMs);
+      }
+    }
+  })();
+
+  return {
+    cancel: () => abort.abort(),
+    sessionId: () => currentSession,
+  };
+}`} lang="ts" title="features/notifications/stream.ts" />
+
+  <Code code={`// app/page.tsx (React-style usage)
+import { useEffect, useState } from "react";
+import { openStream } from "./features/notifications/stream";
+
+export function NotificationBell() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const stream = openStream({
+      baseUrl: "https://notify.example.com",
+      getToken: async () => localStorage.getItem("access_token") || "",
+      onEvent: (ev) => {
+        if (ev.kind === "notification") {
+          setCount((c) => c + 1);
+        }
+      },
+      onError: (err) => console.warn("stream error:", err),
+    });
+    return () => stream.cancel();
+  }, []);
+
+  return <div className="bell">🔔 {count}</div>;
+}`} lang="tsx" title="app/page.tsx" />
+
+  <h2>The handshake heartbeat</h2>
+  <p>
+    The server <em>immediately</em> sends one heartbeat after registering
+    your connection, before any traffic. That heartbeat carries the
+    server-assigned <code>session_id</code>, which is what you pass back
+    on <code>AckDataChange</code> to scope the cancellation to this
+    exact stream. The code above stores it in <code>currentSession</code>.
+  </p>
+
+  <h2>Reconnect strategy</h2>
+  <p>
+    Streams die for legitimate reasons: laptop sleep, server rolling
+    deploy, mobile carrier handover, network blip. The code above
+    reconnects with exponential backoff (500ms → 1s → 2s → ... → 30s)
+    with a 0–250ms jitter so a herd of clients does not synchronise
+    its reconnects.
+  </p>
+  <p>
+    Reconnecting is safe: any in-flight events the client missed are
+    still in the store and available via
+    <code>GetNotifications</code>. Data-change events the client did
+    not ack will be retried by the server's <code>RetryTracker</code>
+    until either the ack arrives or
+    <code>NOTIFY_LIVE_RETRY_MAX_ATTEMPTS</code> is exhausted.
+  </p>
+
+  <h2>Cold-start catch-up</h2>
+  <p>
+    A typical UI fetches the inbox once on app load to populate the
+    list, then opens the stream for live updates:
+  </p>
+  <Code code={`// On mount: cold-fetch.
+const { notifications, nextCursor, unreadCount } =
+  await client.getNotifications({ limit: 20 });
+
+// Then open the stream and merge incoming.
+openStream({ /* ... */ });`} lang="ts" />
+
+  <h2>Recipe — raw cURL (for debugging only)</h2>
+  <p>
+    Useful for confirming that the stream works at all. Connect over
+    HTTP/2 uses length-prefixed JSON frames, not text/event-stream, so
+    cURL output is not human-friendly. Use <code>--no-buffer</code> and
+    expect binary framing.
+  </p>
+  <Code code={`curl -N --no-buffer \\
+  -X POST http://localhost:8080/elloloop.notify.v1.NotificationClientService/StreamEvents \\
+  -H "Authorization: Bearer dev:user-alice:acme" \\
+  -H "Content-Type: application/connect+json" \\
+  -d '{"deviceType":"DEVICE_TYPE_BROWSER"}'`} lang="bash" />
+
+  <p>
+    For a readable debug stream, use the Connect-Go client in a small
+    Go test harness, or the <code>connect-web</code> client in
+    <code>node --experimental-fetch</code>.
+  </p>
+
+  <h2>Authorization on streams</h2>
+  <p>
+    The JWT is validated at handshake time and the resulting claims live
+    on the stream's context for its entire lifetime. <strong>The
+    platform does not re-validate mid-stream.</strong> If a token's
+    <code>exp</code> is reached during a long-lived stream, the existing
+    stream keeps flowing until disconnect; the client must mint a fresh
+    token before its next reconnect.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/in-app">In-app channel</a></li>
+    <li><a href="/notify/docs/examples/ack-notification">Ack a notification</a></li>
+    <li><a href="/notify/docs/api-reference/grpc#notificationclientservice">API Reference: StreamEvents</a></li>
+  </ul>
+</DocsLayout>

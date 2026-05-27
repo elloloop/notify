@@ -1,0 +1,131 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Docker">
+  <h1>Docker</h1>
+  <p>
+    The reference deployment shape is the published multi-arch container
+    image at <code>ghcr.io/elloloop/notify</code>. It is a
+    <code>FROM scratch</code> binary plus CA certificates — no shell, no
+    package manager, ~10 MB.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    This is the recommended path for every environment except library mode.
+    Local dev, staging, production: same image, different env vars. If you
+    want to embed notify in another Go binary, see
+    <a href="https://github.com/elloloop/notify#library-usage">library
+    usage</a> in the README.
+  </p>
+
+  <h2>Pull and run</h2>
+  <Code code={`docker pull ghcr.io/elloloop/notify:latest
+
+docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  -e NOTIFY_AUTH_JWT_SECRET=$(openssl rand -hex 32) \\
+  -e NOTIFY_INTERNAL_TOKEN=$(openssl rand -hex 32) \\
+  -e NOTIFY_EMAIL_PROVIDER=none \\
+  ghcr.io/elloloop/notify:latest`} lang="bash" title="docker run" />
+
+  <p>Pin to a specific tag in CI and production:</p>
+  <Code code={`docker pull ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <h2>Ports</h2>
+  <table>
+    <tr><th>Port</th><th>Listener</th><th>Audience</th></tr>
+    <tr><td>8080</td><td><code>NotificationClientService</code></td><td>Browser / mobile recipients (Connect HTTP/2)</td></tr>
+    <tr><td>8081</td><td><code>NotificationInternalService</code></td><td>Backend producers (gRPC / Connect)</td></tr>
+    <tr><td>9090</td><td><code>/healthz</code> and <code>/metrics</code></td><td>Orchestrators / Prometheus</td></tr>
+  </table>
+
+  <h2>Image layout</h2>
+  <p>
+    The Dockerfile builds a <code>FROM --platform=$BUILDPLATFORM
+    golang:1.26.3-alpine3.23</code> stage that produces a static
+    binary, then COPYs the binary and CA bundle into
+    <code>FROM scratch</code>. The final image runs as UID
+    <code>65532</code> (non-root):
+  </p>
+
+  <Code code={`FROM scratch AS server
+
+COPY --from=builder /bin/notifyd /bin/notifyd
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+EXPOSE 8080 8081 9090
+USER 65532:65532
+ENTRYPOINT ["/bin/notifyd"]`} lang="dockerfile" title="Dockerfile" />
+
+  <h2>Healthcheck</h2>
+  <p>
+    The container has no shell — you can't <code>HEALTHCHECK CMD curl …</code>
+    against itself. Probe from the orchestrator side instead:
+  </p>
+  <Code code={`# docker-compose
+healthcheck:
+  test: ["CMD-SHELL", "wget -q -O- http://localhost:9090/healthz | grep -q ok"]
+  interval: 10s
+  timeout: 3s
+  retries: 5`} lang="yaml" title="docker-compose snippet (probe from a sidecar)" />
+
+  <p>
+    For Kubernetes use HTTP probes — see
+    <a href="/notify/docs/deployment/kubernetes">Kubernetes</a>.
+  </p>
+
+  <h2>docker-compose example</h2>
+  <Code code={`services:
+  notify:
+    image: ghcr.io/elloloop/notify:0.1.0
+    ports:
+      - "8080:8080"   # client
+      - "8081:8081"   # internal
+      - "9090:9090"   # metrics
+    environment:
+      NOTIFY_STORE_DRIVER: memory
+      NOTIFY_AUTH_JWT_SECRET: \${NOTIFY_AUTH_JWT_SECRET}
+      NOTIFY_INTERNAL_TOKEN: \${NOTIFY_INTERNAL_TOKEN}
+      NOTIFY_LOG_LEVEL: info
+      # Channel providers
+      NOTIFY_EMAIL_PROVIDER: emailservice
+      NOTIFY_EMAIL_SERVICE_ADDRESS: emailservice:50053
+      NOTIFY_EMAIL_FROM: noreply@example.com
+      NOTIFY_SMS_PROVIDER: twilio
+      NOTIFY_SMS_ACCOUNT_SID: \${TWILIO_ACCOUNT_SID}
+      NOTIFY_SMS_AUTH_TOKEN: \${TWILIO_AUTH_TOKEN}
+      NOTIFY_SMS_FROM: "+15555550000"`} lang="yaml" title="compose.yaml" />
+
+  <h2>Image verification</h2>
+  <p>
+    Every published image is signed via cosign keyless OIDC and scanned by
+    Trivy with a HIGH/CRITICAL gate. Verify the signature on pull:
+  </p>
+  <Code code={`cosign verify ghcr.io/elloloop/notify:0.1.0 \\
+  --certificate-identity-regexp 'https://github\\.com/elloloop/notify/' \\
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com`} lang="bash" />
+
+  <h2>Building locally</h2>
+  <Code code={`git clone https://github.com/elloloop/notify
+cd notify
+docker build -t notify:dev .
+
+docker run --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  notify:dev`} lang="bash" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a> — every NOTIFY_* var</li>
+    <li><a href="/notify/docs/installation/jwt-keys">JWT Keys</a> — generating production secrets</li>
+    <li><a href="/notify/docs/installation/store-setup">Store Setup</a> — picking a durable backend</li>
+    <li><a href="/notify/docs/deployment/docker">Deployment: Docker</a> — production tuning</li>
+    <li><a href="/notify/docs/deployment/kubernetes">Deployment: Kubernetes</a> — Deployment + Service + Ingress manifests</li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,140 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="WhatsApp channel">
+  <h1>WhatsApp channel</h1>
+  <p>
+    The WhatsApp channel delivers messages via Twilio's WhatsApp Business
+    pipeline. It reuses the same Twilio <code>Client</code> as
+    <a href="/notify/docs/channels/sms">SMS</a> — only the wire-level
+    formatting differs: both addresses are prefixed with
+    <code>whatsapp:</code> so Twilio routes through the WhatsApp pipeline
+    instead of SMS.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Where WhatsApp is the dominant messaging app (LatAm, India,
+    Indonesia, much of EMEA) and your users have opted in via a
+    pre-approved template flow on the Twilio side.
+  </p>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_WHATSAPP_PROVIDER=twilio \\
+-e NOTIFY_WHATSAPP_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \\
+-e NOTIFY_WHATSAPP_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \\
+-e NOTIFY_WHATSAPP_FROM=+15555550000`} lang="bash" />
+
+  <p>
+    Pass the From number <em>without</em> the <code>whatsapp:</code>
+    prefix — the provider adds it for you. Same Twilio credentials can
+    drive both the SMS and WhatsApp channels; the channel kind
+    disambiguates in the registry.
+  </p>
+
+  <h2>Library wiring</h2>
+  <Code code={`import (
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/channels/twilio"
+)
+
+client := twilio.NewClient(twilio.ClientConfig{
+    AccountSID: "ACxxx",
+    AuthToken:  "xxx",
+    From:       "+15555550000", // bare E.164; whatsapp: prefix added by provider
+})
+
+registry := notify.NewProviderRegistry()
+registry.Register(twilio.NewWhatsApp(client))
+// You can register the SMS provider against the same client too:
+registry.Register(twilio.NewSMS(client))`} lang="go" />
+
+  <h2>Sending a WhatsApp message</h2>
+  <p>
+    The producer supplies the recipient as a bare E.164 number — same as
+    SMS — and the channel decides the routing.
+  </p>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "checkin-2026-05-27",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_WHATSAPP"],
+    "title": "Order shipped",
+    "body": "Your order #4017 is on its way.",
+    "addresses": {
+      "user-alice": {
+        "byChannel": {
+          "whatsapp": "+15555550199"
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <p>
+    The provider builds the Twilio request with the
+    <code>whatsapp:</code> prefix automatically:
+  </p>
+  <Code code={`// channels/twilio/whatsapp.go
+form := url.Values{}
+form.Set("To", ensureWhatsAppPrefix(to))      // "whatsapp:+15555550199"
+
+fromKey, fromVal := p.client.pickFrom()
+if fromKey == "From" {
+    fromVal = ensureWhatsAppPrefix(fromVal)   // "whatsapp:+15555550000"
+}
+form.Set(fromKey, fromVal)
+form.Set("Body", pickBody(msg))`} lang="go" />
+
+  <p>
+    <code>ensureWhatsAppPrefix</code> is idempotent — calling it on
+    <code>"whatsapp:+15555550000"</code> returns the same string.
+    Callers that have already prefixed their config (legacy code paths,
+    custom Sender wrappers) won't get a double prefix.
+  </p>
+
+  <h2>Validation</h2>
+  <p>
+    The provider strips the <code>whatsapp:</code> prefix for validation
+    and runs the same E.164 structural check used by SMS. Empty,
+    non-E.164, or length-out-of-range addresses short-circuit to
+    <code>StatusFailed</code> without burning a Twilio request.
+  </p>
+
+  <h2>Body composition</h2>
+  <p>
+    Same as SMS: <code>Body</code> wins, falling back to <code>Title</code>.
+    Twilio's WhatsApp pipeline accepts plain text for in-session messages
+    and approved template references for out-of-session — at the proto
+    level notify does not model templates today; pass the rendered text
+    in <code>Body</code>.
+  </p>
+
+  <h2>Messaging Service caveat</h2>
+  <p>
+    Messaging Services do not take the <code>whatsapp:</code> prefix —
+    the prefix only applies to bare <code>From</code> numbers. The
+    provider handles this:
+  </p>
+  <Code code={`fromKey, fromVal := p.client.pickFrom()
+if fromKey == "From" {
+    fromVal = ensureWhatsAppPrefix(fromVal)
+}
+// fromKey == "MessagingServiceSid" → no prefix applied`} lang="go" />
+
+  <h2>Receipts</h2>
+  <p>
+    Same shape as SMS: success returns the Twilio SID as
+    <code>ProviderMessageID</code>, failure surfaces the error.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/sms">SMS channel</a></li>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a></li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,176 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Conformance Suite">
+  <h1>Conformance Suite</h1>
+  <p>
+    <code>store/conformance.RunConformance</code> is the driver-agnostic
+    spec for <code>notify.Store</code>. Memory is the differential
+    reference; every other driver passes the same 24 leaf subtests
+    across six categories or its CI check goes red and the merge is
+    blocked.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <ul>
+    <li>You are adding a new store driver and need to verify it.</li>
+    <li>You are debugging an existing driver — a failure path like <code>TestConformance/postgres/Concurrency/ConcurrentCreate_SameKey_SingleWinner</code> tells you exactly which semantic broke.</li>
+    <li>You want to know which bug classes the suite probes before you ship code.</li>
+  </ul>
+
+  <h2>Wiring a driver into the suite</h2>
+  <Code code={`package mydriver_test
+
+import (
+    "testing"
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/store/conformance"
+    "github.com/elloloop/notify/store/mydriver"
+)
+
+func TestConformance(t *testing.T) {
+    conformance.RunConformance(t, conformance.Driver{
+        Name: "mydriver",
+        New: func(t *testing.T) notify.Store {
+            // Build a fresh, empty Store. Register cleanup with t.Cleanup
+            // if the driver needs per-test teardown so one subtest never
+            // leaks state into the next.
+            return mydriver.New(...)
+        },
+    })
+}`} lang="go" />
+
+  <p>
+    <code>RunConformance</code> wraps everything in
+    <code>t.Run(d.Name, …)</code>, so the test path on failure is
+    <code>TestConformance/&lt;driver&gt;/&lt;Category&gt;/&lt;Subtest&gt;</code>.
+  </p>
+
+  <h2>The 24 subtests</h2>
+  <table>
+    <tr><th>Category</th><th>Subtest</th><th>What it catches</th></tr>
+
+    <tr><td rowspan="8">Core CRUD</td><td><code>CreateGet</code></td><td>basic round-trip; id is assigned by Store, not caller</td></tr>
+    <tr><td><code>GetNotFound</code></td><td>unknown id returns <code>ErrNotFound</code> (not a typed driver error)</td></tr>
+    <tr><td><code>Idempotency</code></td><td>second create with same <code>(tenant, user, notification_id)</code> returns <code>created=false</code>, stamps existing id, leaves stored row unchanged</td></tr>
+    <tr><td><code>StatusTransitions</code></td><td>each status stamps its matching <code>*_at_ms</code> field; unknown id returns <code>ErrNotFound</code></td></tr>
+    <tr><td><code>CursorWalk_ThreePages</code></td><td>multi-page traversal with cursors; last page returns empty cursor</td></tr>
+    <tr><td><code>UnreadFilterAndCount</code></td><td><code>unreadCount</code> is independent of the page window and <code>UnreadOnly</code> filter</td></tr>
+    <tr><td><code>DeviceUpsertRotation</code></td><td>re-registering the same <code>(tenant, user, device_type)</code> rotates token in place; doesn't create a new row</td></tr>
+    <tr><td><code>UserIsolation</code></td><td>cross-user and cross-tenant reads surface as <code>ErrNotFound</code></td></tr>
+
+    <tr><td rowspan="2">Pagination</td><td><code>QueryUserNotifications_AllPagesReturnEveryRow</code></td><td>full-set traversal across many pages — no row dropped, no row duplicated</td></tr>
+    <tr><td><code>StrictLessThanCutoff</code></td><td>cursor semantics are strict <code>&lt;</code>, never <code>&lt;=</code> (otherwise boundary rows repeat)</td></tr>
+
+    <tr><td rowspan="3">FreshTenant</td><td><code>QueryUserNotifications_Empty</code></td><td>query against a never-seen tenant returns empty, not error</td></tr>
+    <tr><td><code>GetNotification_NotFound</code></td><td>same for a single Get</td></tr>
+    <tr><td><code>ListDevices_Empty</code></td><td>same for device listing</td></tr>
+
+    <tr><td rowspan="3">RoundTrip</td><td><code>StringFields_OnCreate</code></td><td>adversarial values — emoji, unicode, SQL-shaped, leading/trailing whitespace, 10k chars — survive byte-for-byte</td></tr>
+    <tr><td><code>Int64_Fidelity_Timestamps</code></td><td>extreme int64 values (<code>max_int64</code>, <code>2^53+1</code>) round-trip exactly — proves the driver does not silently coerce to float64</td></tr>
+    <tr><td><code>LargePayload_Body</code></td><td>64 KiB and 512 KiB bodies round-trip unmodified</td></tr>
+
+    <tr><td rowspan="5">Concurrency</td><td><code>ConcurrentCreate_DistinctKeys_NoLostWrites</code></td><td>16 concurrent creates with distinct keys land 16 rows — the WAL/applier serializes correctly</td></tr>
+    <tr><td><code>ConcurrentCreate_SameKey_SingleWinner</code></td><td><strong>The headline test.</strong> 16 concurrent creates with the same key land exactly one row; all callers see the same canonical id</td></tr>
+    <tr><td><code>ConcurrentUpsertDevice_SameKey_SingleRow</code></td><td>concurrent device upserts on the same <code>(tenant, user, device_type)</code> land exactly one row; token reflects one of the writers</td></tr>
+    <tr><td><code>ConcurrentUpdateStatus_NoError</code></td><td>concurrent status transitions don't error; the final state matches one of the racers</td></tr>
+    <tr><td><code>ConcurrentReadYourWrites_QueryAfterCreate</code></td><td>a writer's very next query sees its own row (no stale-read window)</td></tr>
+
+    <tr><td rowspan="3">KeyEdge</td><td><code>NotificationID_LongValue</code></td><td>256-char notification id round-trips; re-create is idempotent</td></tr>
+    <tr><td><code>NotificationID_SeparatorBytesDoNotCollide</code></td><td>distinct triples with separator-byte payloads do not collide on the composite key (length-prefix encoding canary)</td></tr>
+    <tr><td><code>DeviceType_CaseSensitive_SeparateRows</code></td><td><code>"android"</code> and <code>"Android"</code> are distinct composite keys (byte-exact equality)</td></tr>
+  </table>
+
+  <h2>A representative subtest, walked through</h2>
+  <p>
+    <code>Concurrency/ConcurrentCreate_SameKey_SingleWinner</code> is the
+    subtest that catches the broadest class of bugs. It launches 16
+    goroutines that all call <code>CreateNotification</code> with the
+    same <code>(tenant, user, notification_id)</code>:
+  </p>
+  <Code code={`var wg sync.WaitGroup
+ids := make([]string, 16)
+wons := make([]bool, 16)
+
+for i := 0; i < 16; i++ {
+    i := i
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        n := mkNotif("acme", "u1", "same-key", int64(1000+i))
+        won, err := s.CreateNotification(ctx, n)
+        if err != nil { t.Errorf("create %d: %v", i, err) }
+        ids[i] = n.ID
+        wons[i] = won
+    }()
+}
+wg.Wait()
+
+// Exactly one true in wons.
+trueCount := 0
+for _, w := range wons {
+    if w { trueCount++ }
+}
+if trueCount != 1 {
+    t.Fatalf("expected exactly 1 winner, got %d", trueCount)
+}
+
+// Every reported ID is the canonical id.
+canonical := ids[0]
+for i, id := range ids {
+    if id != canonical {
+        t.Fatalf("racer %d saw %q, want %q", i, id, canonical)
+    }
+}`} lang="go" />
+
+  <p>
+    This catches:
+  </p>
+  <ul>
+    <li><strong>Missing composite-unique constraint</strong> — drivers that rely on a query-then-create pattern without server-side enforcement let multiple rows land. (This is precisely what tripped EntDB v1.32.1 before v2's schema-aware enforcement.)</li>
+    <li><strong>Wrong loser path</strong> — drivers that survive the constraint but return a non-canonical id to the loser.</li>
+    <li><strong>Lost-update bugs</strong> — drivers that silently overwrite the original row's title / body / status with a racer's values.</li>
+  </ul>
+
+  <h2>CONFORMANCE.md per driver</h2>
+  <p>
+    Each non-memory driver ships a <code>CONFORMANCE.md</code> with the
+    full per-subtest table, status, and a one-line root-cause note for
+    anything red. Templates to follow:
+  </p>
+  <ul>
+    <li><a href="https://github.com/elloloop/notify/blob/main/store/postgres/CONFORMANCE.md">store/postgres/CONFORMANCE.md</a> — 24/24, design notes on idempotency / pagination / migrations</li>
+    <li><a href="https://github.com/elloloop/notify/blob/main/store/entdb/CONFORMANCE.md">store/entdb/CONFORMANCE.md</a> — 24/24 on v2.0.5, the v1.32.1 → v2 flip story, upstream items #U1–#U4</li>
+  </ul>
+
+  <h2>CI gate</h2>
+  <p>
+    <code>.github/workflows/conformance.yml</code> declares one job per
+    driver in a matrix. The check name is
+    <code>Conformance / &lt;driver&gt;</code>, and that is what branch
+    protection pins. A new driver landing PR must add itself to the
+    matrix and turn the new check green.
+  </p>
+
+  <Code code={`matrix:
+  include:
+    - driver: memory
+      package: ./store/memory/...
+    - driver: postgres
+      package: ./store/postgres/...
+      need_postgres: true
+    - driver: entdb
+      package: ./store/entdb/...
+      build_tag: realentdb
+      need_entdb: true`} lang="yaml" title=".github/workflows/conformance.yml — abridged" />
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/store-and-conformance">Concepts: Store &amp; Conformance</a></li>
+    <li><a href="/notify/docs/store/memory">Memory driver</a></li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a></li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a></li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,178 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="SMS channel">
+  <h1>SMS channel</h1>
+  <p>
+    The SMS channel delivers a text message via Twilio's
+    <code>Messages</code> API. The same Twilio <code>Client</code> backs
+    both this provider and the <a href="/notify/docs/channels/whatsapp">WhatsApp
+    provider</a> — the channel-specific rules live on the provider, not
+    the client.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    OTP codes, urgent alerts, anything that needs to reach a user when
+    they don't have your app installed and aren't reading email.
+  </p>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_SMS_PROVIDER=twilio \\
+-e NOTIFY_SMS_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \\
+-e NOTIFY_SMS_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \\
+-e NOTIFY_SMS_FROM=+15555550000`} lang="bash" />
+
+  <p>
+    Alternatively configure a Messaging Service for sender pools / pool-of-numbers:
+  </p>
+  <Code code={`-e NOTIFY_SMS_PROVIDER=twilio \\
+-e NOTIFY_SMS_ACCOUNT_SID=ACxxx \\
+-e NOTIFY_SMS_AUTH_TOKEN=xxx \\
+-e NOTIFY_SMS_MESSAGING_SERVICE_SID=MGxxx`} lang="bash" />
+
+  <p>
+    When both <code>From</code> and <code>MessagingServiceSID</code> are
+    set, the provider prefers the Messaging Service.
+  </p>
+
+  <h2>Library wiring</h2>
+  <Code code={`import (
+    "github.com/elloloop/notify"
+    "github.com/elloloop/notify/channels/twilio"
+)
+
+client := twilio.NewClient(twilio.ClientConfig{
+    AccountSID: "ACxxx",
+    AuthToken:  "xxx",
+    From:       "+15555550000",
+})
+
+registry := notify.NewProviderRegistry()
+registry.Register(twilio.NewSMS(client))`} lang="go" />
+
+  <h2>Sending an SMS</h2>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "otp-2026-05-27-001",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_SMS"],
+    "title": "",
+    "body": "Your code: 472918",
+    "addresses": {
+      "user-alice": {
+        "byChannel": {
+          "sms": "+15555550199"
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <p>Response:</p>
+  <Code code={`{"delivered": 1, "pending": 0, "failed": 0}`} lang="json" />
+
+  <h2>Validation</h2>
+  <p>
+    The provider does a cheap structural E.164 check before calling
+    Twilio — empty, missing <code>+</code>, non-digit body, or length
+    outside <code>6..15</code> short-circuits to
+    <code>StatusFailed</code>:
+  </p>
+  <Code code={`func validateE164(s string) error {
+    if s == "" {
+        return errors.New("To: empty recipient address")
+    }
+    if !strings.HasPrefix(s, "+") {
+        return fmt.Errorf("To: %q must be E.164 (must start with '+')", s)
+    }
+    digits := s[1:]
+    if len(digits) < 6 || len(digits) > 15 {
+        return fmt.Errorf("To: %q has invalid length", s)
+    }
+    for _, r := range digits {
+        if r < '0' || r > '9' {
+            return fmt.Errorf("To: %q contains non-digit characters", s)
+        }
+    }
+    return nil
+}`} lang="go" />
+
+  <p>
+    This is intentionally structural, not a phone-number validity check
+    — Twilio remains the authority on whether a number can actually
+    receive SMS. We just avoid burning a request on obvious garbage.
+  </p>
+
+  <h2>Body composition</h2>
+  <p>
+    SMS does not carry a separate subject line. The provider collapses
+    Title and Body with <code>Body</code> winning when non-empty:
+  </p>
+  <ul>
+    <li>Both supplied → only <code>Body</code> is sent.</li>
+    <li>Only <code>Title</code> → <code>Title</code> is sent.</li>
+    <li>Neither → empty body; Twilio rejects with code 21602.</li>
+  </ul>
+
+  <h2>Testing with httptest</h2>
+  <p>
+    Because the provider uses Go's <code>net/http</code> via an
+    injectable <code>http.Client</code>, you can swap the Twilio endpoint
+    for an <code>httptest.Server</code> and drive any response shape from
+    a unit test. The full test lives in
+    <a href="https://github.com/elloloop/notify/blob/main/channels/twilio/sms_test.go">channels/twilio/sms_test.go</a>;
+    abbreviated shape:
+  </p>
+  <Code code={`func TestSMSSend(t *testing.T) {
+    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if got := r.PostFormValue("To"); got != "+15555550199" {
+            t.Fatalf("To = %q", got)
+        }
+        if got := r.PostFormValue("From"); got != "+15555550000" {
+            t.Fatalf("From = %q", got)
+        }
+        if got := r.PostFormValue("Body"); got != "Your code: 472918" {
+            t.Fatalf("Body = %q", got)
+        }
+        w.Header().Set("Content-Type", "application/json")
+        _, _ = w.Write([]byte(\`{"sid":"SM-test-123"}\`))
+    }))
+    defer srv.Close()
+
+    client := twilio.NewClient(twilio.ClientConfig{
+        AccountSID: "ACxxx", AuthToken: "xxx", From: "+15555550000",
+        BaseURL:    srv.URL, // overrides https://api.twilio.com
+    })
+    provider := twilio.NewSMS(client)
+
+    receipt, err := provider.Send(context.Background(), notify.Message{
+        To:    "+15555550199",
+        Title: "",
+        Body:  "Your code: 472918",
+    })
+    if err != nil { t.Fatal(err) }
+    if receipt.ProviderMessageID != "SM-test-123" {
+        t.Fatalf("SID = %q", receipt.ProviderMessageID)
+    }
+}`} lang="go" />
+
+  <h2>Receipts and error handling</h2>
+  <p>
+    On success the receipt carries Twilio's <code>SID</code> as
+    <code>ProviderMessageID</code> and <code>StatusDelivered</code>. On
+    failure the wrapped error is propagated and the row is recorded as
+    <code>StatusFailed</code>.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/whatsapp">WhatsApp channel</a> — same client, different prefix</li>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a></li>
+    <li><a href="/notify/docs/examples/send-notification">Send a notification</a></li>
+  </ul>
+</DocsLayout>

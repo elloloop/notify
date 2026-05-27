@@ -155,6 +155,27 @@ check is bypassed. Never enable dev mode in production.
 | `NOTIFY_APNS_TOPIC` | string | — | Bundle id / topic. |
 | `NOTIFY_APNS_SANDBOX` | bool | `false` | Use the APNs sandbox endpoint. |
 
+## Docs
+
+Full documentation lives at [elloloop.github.io/notify](https://elloloop.github.io/notify/):
+
+- [Quick Start](https://elloloop.github.io/notify/docs/quickstart) — five-minute "hello, notify"
+- [Architecture](https://elloloop.github.io/notify/docs/concepts/architecture)
+- [Configuration reference](https://elloloop.github.io/notify/docs/installation/configuration)
+- [gRPC / Connect API](https://elloloop.github.io/notify/docs/api-reference/grpc)
+- [Send a notification](https://elloloop.github.io/notify/docs/examples/send-notification) — Go / Python / cURL
+- [Subscribe over SSE](https://elloloop.github.io/notify/docs/examples/subscribe-sse)
+
+The source is in [`docs-site/`](./docs-site) — an Astro static site
+built with the `@refraction-ui/astro` shell. Build it locally with:
+
+```bash
+cd docs-site
+pnpm install
+pnpm run build      # produces dist/
+pnpm run preview    # serves on http://127.0.0.1:4321/notify
+```
+
 ## License
 
 AGPL-3.0 — see [LICENSE](./LICENSE).

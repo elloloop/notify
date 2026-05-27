@@ -18,3 +18,8 @@ coverage*
 .DS_Store
 .idea/
 .vscode/
+
+# docs-site build artifacts
+docs-site/node_modules/
+docs-site/dist/
+docs-site/.astro/

@@ -1,0 +1,198 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="EntDB store">
+  <h1>EntDB store</h1>
+  <p>
+    The EntDB driver maps notify's <code>Store</code> contract onto
+    <a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db</a>'s
+    SDK. v0.1 targets <strong>v2 schema-aware mode</strong> (ADR-031) and
+    pins to v2.0.5 — the v2 server materializes the notify schema from
+    proto descriptors and enforces composite uniqueness, which is what
+    makes the concurrent-create conformance test pass without a
+    service-level mutex.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Pick EntDB if you already run tenant-shard-db for another service
+    (e.g. identity) and want notify to share the operational story —
+    same image management, same WAL pipeline, same scaling story. For
+    greenfield deployments, the Postgres driver is the more common
+    starting point.
+  </p>
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_STORE_DRIVER=entdb \\
+-e NOTIFY_ENTDB_ADDRESS=entdb.internal:50051 \\
+-e NOTIFY_ENTDB_TENANT_ID=notify-prod`} lang="bash" />
+
+  <p>
+    <code>NOTIFY_ENTDB_TENANT_ID</code> is the EntDB storage shard — one
+    notify container talks to one EntDB tenant. All notify-application
+    tenants live under that one EntDB tenant, differentiated by the
+    <code>tenant_id</code> field on each row.
+  </p>
+
+  <h2>Schema (proto-first)</h2>
+  <p>
+    Schema is declared as proto messages in
+    <code>proto/entdb_notify/notify.proto</code>. <code>type_id</code>
+    values are local to notify's tenant-shard-db instance (it runs its
+    own EntDB deployment), so the type ids do not need to coordinate
+    with identity's.
+  </p>
+
+  <Code code={`message UserNotification {
+  option (entdb.node) = {
+    type_id: 1
+    data_policy: DATA_POLICY_PERSONAL
+    subject_field: "user_id"
+    description: "Per-user copy of one notification"
+  };
+
+  string notification_id  = 1  [(entdb.field) = { required: true, indexed: true }];
+  string tenant_id        = 2  [(entdb.field) = { required: true, indexed: true }];
+  string user_id          = 3  [(entdb.field) = { required: true, indexed: true }];
+  string subject_ref      = 4;
+  string subject_type     = 5;
+  string title            = 6;
+  string body             = 7;
+  string channel          = 8;
+  string delivery_status  = 9  [(entdb.field) = { required: true, indexed: true }];
+  int64  created_at_ms    = 10 [(entdb.field) = { kind: "timestamp", indexed: true }];
+  int64  delivered_at_ms  = 11 [(entdb.field) = { kind: "timestamp" }];
+  int64  ack_at_ms        = 12 [(entdb.field) = { kind: "timestamp" }];
+  int64  read_at_ms       = 13 [(entdb.field) = { kind: "timestamp" }];
+  // composite_key = "<tenant>|<user>|<notification_id>"
+  string composite_key    = 14 [(entdb.field) = { required: true, indexed: true, unique: true }];
+}
+
+message DeviceRegistration {
+  option (entdb.node) = {
+    type_id: 2
+    data_policy: DATA_POLICY_PERSONAL
+    subject_field: "user_id"
+    description: "A registered push endpoint for one user on one device type"
+  };
+
+  string tenant_id      = 1 [(entdb.field) = { required: true, indexed: true }];
+  string user_id        = 2 [(entdb.field) = { required: true, indexed: true }];
+  string device_type    = 3 [(entdb.field) = { required: true }];
+  string token          = 4 [(entdb.field) = { required: true }];
+  int64  created_at_ms  = 5 [(entdb.field) = { kind: "timestamp" }];
+  int64  last_active_ms = 6 [(entdb.field) = { kind: "timestamp" }];
+  string composite_key  = 7 [(entdb.field) = { required: true, indexed: true, unique: true }];
+}`} lang="proto" title="proto/entdb_notify/notify.proto" />
+
+  <p>
+    The <code>composite_key</code> field on each node is the unique
+    index the driver hits via <code>sdk.GetByKey</code> for the
+    idempotency guard. v2 server enforces the
+    <code>unique: true</code> annotation, closing the
+    composite-uniqueness race the v1.32.1 canary tests reproduced.
+  </p>
+
+  <h2>composite_key is length-prefix encoded</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    The composite key string is built by length-prefix encoding each
+    part rather than concatenating with a separator. A naive
+    <code>"u1|n1|n2"</code> scheme collides for two distinct triples
+    that escape differently (e.g. one with a literal <code>|</code> in
+    the user id). The driver's <code>lpEncode</code> helper writes
+    <code>&lt;len&gt;:&lt;part&gt;</code> for each piece so the
+    serialization is injective. The
+    <code>KeyEdge/NotificationID_SeparatorBytesDoNotCollide</code>
+    conformance test pins this invariant — drivers that get it wrong
+    would silently treat two different rows as the same.
+  </blockquote>
+
+  <h2>Schema-aware mode + composite uniqueness</h2>
+  <p>
+    The container wires the SDK with the registered schema at boot:
+  </p>
+  <Code code={`client, err := sdk.NewClient(
+    cfg.Store.EntDBAddress,
+    sdk.WithSchema(entdb.SchemaMessages()...),
+)`} lang="go" />
+
+  <p>
+    <code>entdb.SchemaMessages()</code> returns the two proto descriptors
+    declared above. The v2 server materializes the schema from those
+    descriptors on the first <code>ExecuteAtomic</code> call and
+    enforces every annotation including <code>unique: true</code>.
+    Concurrent <code>CreateNotification</code> calls with the same
+    <code>composite_key</code> now produce exactly one row.
+  </p>
+
+  <h2>The same-key race resolution</h2>
+  <p>
+    The Go SDK's <code>Plan.Commit</code> does not expose
+    <code>wait_applied</code> today (upstream item #U1, documented in
+    <a href="https://github.com/elloloop/notify/blob/main/store/entdb/CONFORMANCE.md">store/entdb/CONFORMANCE.md</a>),
+    so the loser of a unique-constraint race receives a
+    <code>success=true</code> receipt with a pre-allocated node id that
+    never actually lands. The driver reconciles in code:
+  </p>
+  <Code code={`// commitCreateUnique helpers.go (abridged)
+submittedID, _ := commitCreateNoWait(ctx, actor, msg)        // server pre-allocates a UUID
+canonical, _  := findByKeyWithRetry(ctx, actor, key, val)    // bounded sdk.GetByKey poll
+won := canonical == submittedID                              // winner: ids match; loser: differ`} lang="go" />
+
+  <p>
+    <code>CreateNotification</code> returns
+    <code>(canonicalID, won)</code> so the caller learns whether it was
+    the actual writer. <code>UpsertDevice</code> additionally runs a
+    no-wait <code>UpdateFields</code> against the canonical row in the
+    loser branch so each racer's token / last_active_ms gets a chance to
+    land (preserving memory's "last writer wins" semantics).
+  </p>
+
+  <h2>Run conditions</h2>
+  <ul>
+    <li>Image: <code>ghcr.io/elloloop/tenant-shard-db:2.0.5</code> (pin in <code>docker-compose</code> or your Helm chart).</li>
+    <li>SDK: <code>github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2 v2.0.5</code>.</li>
+    <li>Server flags: <code>-addr=:50051 -data-dir=/tmp/entdb -wal-backend=memory</code> (<code>-data-dir</code> is required on v2).</li>
+    <li>Schema-aware mode enabled via <code>sdk.WithSchema(entdb.SchemaMessages()...)</code>.</li>
+  </ul>
+
+  <h2>Conformance results</h2>
+  <p>
+    <strong>24/24 PASS</strong> on v2.0.5 — including the two
+    composite-uniqueness canaries that were intentionally red on v1.32.1
+    (they flipped when the v2 schema-aware unique enforcement landed).
+    See <a href="https://github.com/elloloop/notify/blob/main/store/entdb/CONFORMANCE.md">store/entdb/CONFORMANCE.md</a>
+    for the per-subtest table.
+  </p>
+
+  <h2>Running the suite locally</h2>
+  <Code code={`# Boot a local EntDB on a free port.
+docker run -d --rm --name notify-entdb-test -p 50061:50051 \\
+  ghcr.io/elloloop/tenant-shard-db:2.0.5 \\
+  -addr=:50051 -data-dir=/tmp/entdb -wal-backend=memory
+
+# Run the suite (build tag gates real-entdb tests).
+NOTIFY_ENTDB_ADDRESS=localhost:50061 \\
+  go test -tags=realentdb ./store/entdb/... -race -count=1 -v -timeout=5m
+
+docker stop notify-entdb-test`} lang="bash" />
+
+  <h2>What the suite does NOT cover</h2>
+  <p>Intentional omissions documented for transparency:</p>
+  <ul>
+    <li><strong>Cross-tenant ACL.</strong> The suite uses a fresh tenant per subtest, so it never observes cross-tenant data. The driver hard-codes <code>system:notify</code> as the actor for every read and write; cross-tenant isolation is enforced by the <code>tenantID</code> argument the driver passes to the SDK transport.</li>
+    <li><strong>Long-lived connections.</strong> SDK client is reused across subtests; reconnection behaviour is tested upstream.</li>
+    <li><strong>Server crash / WAL replay.</strong> The driver assumes the server is available; failover is the operator's concern.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/store-setup">Store Setup → EntDB</a></li>
+    <li><a href="/notify/docs/store/conformance">Conformance Suite</a></li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a></li>
+    <li><a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db repo</a></li>
+  </ul>
+</DocsLayout>

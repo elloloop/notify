@@ -1,0 +1,276 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Deployment — Kubernetes">
+  <h1>Deployment — Kubernetes</h1>
+  <p>
+    Manifests for a production-shape Kubernetes deployment of notify:
+    one Deployment, two Services (one internal-only, one exposed via
+    Ingress), a Secret for the credentials, and an HPA tuned for the
+    realtime workload.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    You already run Kubernetes and want notify to ride your existing
+    operational story — Helm-ish chart, GitOps via Argo / Flux, mesh-of-
+    your-choice, etc.
+  </p>
+
+  <h2>Namespace + Secret</h2>
+  <Code code={`apiVersion: v1
+kind: Namespace
+metadata:
+  name: notify
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: notify-secrets
+  namespace: notify
+type: Opaque
+stringData:
+  NOTIFY_AUTH_JWT_SECRET: "<32-byte hex>"
+  NOTIFY_INTERNAL_TOKEN:  "<32-byte hex>"
+  NOTIFY_POSTGRES_DSN:    "postgres://notify:password@db.notify:5432/notify?sslmode=require"
+  TWILIO_AUTH_TOKEN:      "..."
+  FCM_SERVICE_ACCOUNT_JSON: |
+    { "type": "service_account", ... }`} lang="yaml" title="00-namespace-secret.yaml" />
+
+  <p>
+    Project these from your secret manager via External Secrets Operator,
+    Sealed Secrets, or whatever your shop uses. The point is that they
+    live <em>outside</em> the manifest tree.
+  </p>
+
+  <h2>Deployment</h2>
+  <Code code={`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notify
+  namespace: notify
+  labels: { app: notify }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: notify } }
+  template:
+    metadata:
+      labels: { app: notify }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 45     # NOTIFY_SHUTDOWN_TIMEOUT + headroom
+      containers:
+        - name: notify
+          image: ghcr.io/elloloop/notify:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: client
+              containerPort: 8080
+            - name: internal
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9090
+          env:
+            - { name: NOTIFY_STORE_DRIVER, value: postgres }
+            - { name: NOTIFY_POSTGRES_AUTOMIGRATE, value: "true" }
+            - { name: NOTIFY_LOG_LEVEL, value: info }
+            - { name: NOTIFY_SHUTDOWN_TIMEOUT, value: "30s" }
+            - { name: NOTIFY_AUTH_JWT_ISSUER, value: https://identity.example.com }
+            - { name: NOTIFY_ALLOWED_ORIGINS, value: https://app.example.com }
+            # Email provider
+            - { name: NOTIFY_EMAIL_PROVIDER, value: emailservice }
+            - { name: NOTIFY_EMAIL_SERVICE_ADDRESS, value: emailservice.email:50053 }
+            - { name: NOTIFY_EMAIL_FROM, value: noreply@example.com }
+            # SMS provider
+            - { name: NOTIFY_SMS_PROVIDER, value: twilio }
+            - { name: NOTIFY_SMS_ACCOUNT_SID, value: ACxxxx }
+            - { name: NOTIFY_SMS_FROM, value: "+15555550000" }
+          envFrom:
+            - secretRef: { name: notify-secrets }
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits:   { cpu: 1000m, memory: 256Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }`} lang="yaml" title="10-deployment.yaml" />
+
+  <h2>Services</h2>
+  <Code code={`# Public surface — what the SPA / mobile clients hit, fronted by Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notify-client
+  namespace: notify
+spec:
+  type: ClusterIP
+  selector: { app: notify }
+  ports:
+    - name: client
+      port: 8080
+      targetPort: client
+
+---
+# Internal surface — only backend producers in the cluster reach this.
+# Pin a NetworkPolicy that only allows ingress from the producing
+# services' namespaces.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notify-internal
+  namespace: notify
+spec:
+  type: ClusterIP
+  selector: { app: notify }
+  ports:
+    - name: internal
+      port: 8081
+      targetPort: internal
+
+---
+# Metrics — scraped by your in-cluster Prometheus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notify-metrics
+  namespace: notify
+  labels: { app: notify }
+spec:
+  type: ClusterIP
+  selector: { app: notify }
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics`} lang="yaml" title="20-services.yaml" />
+
+  <h2>Ingress (client surface)</h2>
+  <Code code={`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: notify
+  namespace: notify
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"        # long-lived SSE streams
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [notify.example.com]
+      secretName: notify-tls
+  rules:
+    - host: notify.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: notify-client
+                port: { name: client }`} lang="yaml" title="30-ingress.yaml" />
+
+  <p>
+    The long <code>proxy-{`{read,send}`}-timeout</code> values matter for
+    <code>StreamEvents</code> — without them nginx will close the
+    long-lived SSE connection after 60s.
+  </p>
+
+  <h2>NetworkPolicy (internal port lockdown)</h2>
+  <Code code={`apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-internal-allowlist
+  namespace: notify
+spec:
+  podSelector: { matchLabels: { app: notify } }
+  policyTypes: [Ingress]
+  ingress:
+    # Producers in the api-gateway namespace can hit the internal port.
+    - from:
+        - namespaceSelector: { matchLabels: { name: api-gateway } }
+      ports:
+        - { port: 8081, protocol: TCP }
+    # Anyone in the cluster can hit the client port (Ingress fronts it).
+    - from: []
+      ports:
+        - { port: 8080, protocol: TCP }
+    # Prometheus reaches metrics.
+    - from:
+        - namespaceSelector: { matchLabels: { name: monitoring } }
+      ports:
+        - { port: 9090, protocol: TCP }`} lang="yaml" title="40-networkpolicy.yaml" />
+
+  <h2>Horizontal Pod Autoscaler</h2>
+  <p>
+    The realtime workload is connection-count bound rather than CPU
+    bound. The HPA below uses CPU as a coarse signal; when the
+    Prometheus metric surface is wired (follow-up wave) you can switch
+    to a custom metric (e.g. <code>notify_live_connections</code>).
+  </p>
+  <Code code={`apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: notify
+  namespace: notify
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: notify
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 60 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300     # avoid flapping
+    scaleUp:
+      stabilizationWindowSeconds: 30`} lang="yaml" title="50-hpa.yaml" />
+
+  <h2>PodDisruptionBudget</h2>
+  <Code code={`apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: notify
+  namespace: notify
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app: notify } }`} lang="yaml" title="60-pdb.yaml" />
+
+  <h2>Rolling deploy semantics</h2>
+  <ul>
+    <li>New pod boots, <code>/healthz</code> returns 503 until <code>Server.Run</code> binds listeners → marks ready.</li>
+    <li>Service starts routing traffic to the new pod.</li>
+    <li>Old pod receives SIGTERM, <code>/healthz</code> immediately flips to 503 → Service stops sending new traffic.</li>
+    <li><code>Shutdown</code> drains in-flight requests within <code>NOTIFY_SHUTDOWN_TIMEOUT</code>.</li>
+    <li>Open SSE streams: each handler exits on context cancel, client reconnects to whichever pod the LB picks next.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/deployment/docker">Deployment: Docker</a></li>
+    <li><a href="/notify/docs/deployment/github-actions">GitHub Actions (release pipeline)</a></li>
+    <li><a href="/notify/docs/operations/shutdown">Graceful shutdown</a></li>
+  </ul>
+</DocsLayout>

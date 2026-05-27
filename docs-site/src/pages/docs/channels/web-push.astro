@@ -1,0 +1,179 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Web Push channel">
+  <h1>Web Push channel</h1>
+  <p>
+    Web Push delivers notifications to a browser even when your tab is
+    closed, via the W3C Push API (RFC 8030) with VAPID (RFC 8292) for
+    application-server identification and the <code>aes128gcm</code>
+    content encoding (RFC 8291) for payload encryption.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    Anything you'd push to a desktop or mobile-web user who isn't
+    currently looking at your app. Common cases: chat messages while the
+    tab is in the background, new email/comment alerts, urgent system
+    notifications.
+  </p>
+
+  <h2>Provider: VAPID</h2>
+  <p>
+    The provider implementation lives in
+    <code>channels/webpush</code> and wraps
+    <code>github.com/SherClockHolmes/webpush-go</code> for the on-wire
+    encryption work. notify owns:
+  </p>
+  <ul>
+    <li>Subscription JSON parsing + validation (rejects missing <code>endpoint</code> / <code>keys.auth</code> / <code>keys.p256dh</code> early).</li>
+    <li>RFC 8292 subscriber validation (<code>mailto:</code>, <code>https://</code>, or bare <code>user@host</code>).</li>
+    <li>Defaults for <code>TTL</code> (60s) and <code>Urgency</code> (normal), overridable via options.</li>
+    <li>Status mapping: <code>200/201/202</code> → <code>StatusDelivered</code>; <code>410 Gone</code> → <code>ErrSubscriptionGone</code>; everything else → <code>StatusFailed</code> with the body text.</li>
+  </ul>
+
+  <h2>Generating VAPID keys</h2>
+  <Code code={`# One-off: generate a VAPID key pair.
+# npm: npx web-push generate-vapid-keys
+# Or via openssl:
+openssl ecparam -name prime256v1 -genkey -noout -out vapid-private.pem
+openssl ec -in vapid-private.pem -pubout -out vapid-public.pem
+
+# Convert to base64url (RFC 8292 wire form). web-push-libs/web-push-go
+# accepts either base64 or base64url; configure base64url for the
+# server-side and the browser PushManager call.`} lang="bash" />
+
+  <h2>Configuration</h2>
+  <Code code={`-e NOTIFY_WEBPUSH_PROVIDER=vapid \\
+-e NOTIFY_WEBPUSH_VAPID_PUBLIC=BNcL... \\
+-e NOTIFY_WEBPUSH_VAPID_PRIVATE=Yt8L... \\
+-e NOTIFY_WEBPUSH_CONTACT_EMAIL=mailto:ops@example.com`} lang="bash" />
+
+  <p>
+    The contact email is required by RFC 8292; push services may reject
+    anonymous senders. <code>mailto:</code> and <code>https://</code>
+    URLs are both accepted; a bare <code>user@host</code> string is
+    auto-prefixed with <code>mailto:</code>.
+  </p>
+
+  <h2>Browser side — service worker registration</h2>
+  <Code code={`// public/sw.js — the service worker that surfaces incoming pushes.
+self.addEventListener("push", (event) => {
+  const data = event.data?.json() ?? {};
+  event.waitUntil(
+    self.registration.showNotification(data.title || "Notification", {
+      body: data.body,
+      data: data.data,            // your deep-link key/values
+      icon: "/icon-192.png",
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    clients.openWindow(event.notification.data?.url || "/")
+  );
+});`} lang="js" title="public/sw.js" />
+
+  <h2>Browser side — subscribe + register</h2>
+  <Code code={`// Convert base64url VAPID public key to a Uint8Array PushManager wants.
+function urlBase64ToUint8Array(b64) {
+  const padded = (b64 + "=".repeat((4 - b64.length % 4) % 4))
+    .replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(padded);
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function subscribePush(vapidPublicKey) {
+  const reg = await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+    });
+  }
+
+  // Register with notify.
+  await client.registerPushToken({
+    deviceType: "DEVICE_TYPE_BROWSER",
+    token: JSON.stringify(sub),    // the whole PushSubscription JSON
+  });
+}`} lang="ts" title="subscribe.ts" />
+
+  <h2>Sending a web push</h2>
+  <p>
+    The provider expects the JSON-stringified <code>PushSubscription</code>
+    as the address. In production this comes from the device store
+    (<code>RegisterPushToken</code> writes it); in a one-off call you can
+    inline it in the Addresses map.
+  </p>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "chat-msg-9001",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_WEB_PUSH"],
+    "title": "Bob",
+    "body": "Are you around?",
+    "addresses": {
+      "user-alice": {
+        "byChannel": {
+          "web_push": "{\\"endpoint\\":\\"https://fcm.googleapis.com/fcm/send/...\\",\\"keys\\":{\\"auth\\":\\"...\\",\\"p256dh\\":\\"...\\"}}"
+        }
+      }
+    }
+  }'`} lang="bash" />
+
+  <h2>Handling ErrSubscriptionGone</h2>
+  <p>
+    HTTP 410 from the push service means the user has unsubscribed or
+    uninstalled the browser. The provider surfaces this as a sentinel
+    you can match with <code>errors.Is</code>:
+  </p>
+  <Code code={`import "github.com/elloloop/notify/channels/webpush"
+
+receipt, err := provider.Send(ctx, msg)
+if err != nil {
+    if errors.Is(err, webpush.ErrSubscriptionGone) {
+        // Purge the device row in your store. notify itself never
+        // auto-purges — the device store is yours.
+        deviceStore.Delete(ctx, msg.Notification.TenantID, msg.Notification.UserID, "browser")
+    } else {
+        log.Warn("webpush_send_failed", "err", err)
+    }
+}`} lang="go" />
+
+  <h2>Why the provider does not auto-purge</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    Both web push (<code>ErrSubscriptionGone</code>) and FCM
+    (<code>ErrUnregisteredToken</code>) expose token-is-dead as a typed
+    error. The provider never deletes the corresponding device row
+    itself because (a) the device store is owned by the orchestrator,
+    not the provider, and (b) a future caller may want to keep the row
+    for audit or to attempt re-registration. Providers stay stateless;
+    purge logic lives at the call site.
+  </blockquote>
+
+  <h2>Receipts</h2>
+  <p>
+    Push services don't return a message id, so successful receipts
+    have an empty <code>ProviderMessageID</code>. The status is
+    <code>StatusDelivered</code> on 200/201/202.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/mobile-push">Mobile push channel</a> — sibling channel for native apps</li>
+    <li><a href="/notify/docs/examples/register-push-token">Register a push token</a> — full round-trip example</li>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a></li>
+  </ul>
+</DocsLayout>

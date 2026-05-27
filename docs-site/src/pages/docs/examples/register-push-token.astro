@@ -1,0 +1,243 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Example — Register a Push Token">
+  <h1>Register a Push Token</h1>
+  <p>
+    End-to-end flow for both Web Push (browser, VAPID) and mobile push
+    (FCM). The token is stored in notify's device table keyed by
+    <code>(tenant, user, device_type)</code>; sending then just supplies
+    the user id and notify resolves the right token per channel.
+  </p>
+
+  <h2>When you'd use this</h2>
+  <p>
+    First-launch of your client app, or whenever the browser /OS rolls
+    the underlying token (push services do this occasionally). Always
+    re-register on app start — <code>UpsertDevice</code> is idempotent;
+    a no-change call is a cheap no-op.
+  </p>
+
+  <h2>Web Push — full round-trip</h2>
+
+  <h3>1. Set up VAPID keys on the server</h3>
+  <Code code={`# One-off. Generate a VAPID key pair and feed the public key to the browser,
+# the private key to notify.
+npx web-push generate-vapid-keys
+
+# Public Key:  BNcL...
+# Private Key: Yt8L...
+
+# notify config
+NOTIFY_WEBPUSH_PROVIDER=vapid
+NOTIFY_WEBPUSH_VAPID_PUBLIC=BNcL...
+NOTIFY_WEBPUSH_VAPID_PRIVATE=Yt8L...
+NOTIFY_WEBPUSH_CONTACT_EMAIL=mailto:ops@example.com`} lang="bash" />
+
+  <h3>2. Register the service worker</h3>
+  <Code code={`// public/sw.js
+self.addEventListener("push", (event) => {
+  const data = event.data?.json() ?? {};
+  event.waitUntil(
+    self.registration.showNotification(data.title || "Notification", {
+      body: data.body,
+      data: data.data,
+      icon: "/icon-192.png",
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    clients.openWindow(event.notification.data?.url || "/")
+  );
+});`} lang="js" title="public/sw.js" />
+
+  <h3>3. Subscribe and register</h3>
+  <Code code={`// features/push/web-push.ts
+import { client } from "../../shared/notify-client";
+
+const VAPID_PUBLIC_KEY = "<your public key>";
+
+function urlBase64ToUint8Array(b64: string): Uint8Array {
+  const padded = (b64 + "=".repeat((4 - b64.length % 4) % 4))
+    .replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(padded);
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+export async function enableWebPush(): Promise<void> {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    throw new Error("Push API not available in this browser");
+  }
+
+  // 1. Service worker.
+  const reg = await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+
+  // 2. Permission. Must be triggered by a user gesture.
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") {
+    throw new Error("Notification permission denied");
+  }
+
+  // 3. PushManager subscription.
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+  }
+
+  // 4. Hand the subscription JSON to notify.
+  await client.registerPushToken({
+    deviceType: "DEVICE_TYPE_BROWSER",
+    token: JSON.stringify(sub),
+  });
+}`} lang="ts" title="features/push/web-push.ts" />
+
+  <h3>4. Send via Web Push</h3>
+  <p>
+    From the producer, you don't need to thread the address — once
+    registered, notify will resolve the device token automatically when
+    a follow-up wave wires "store-side address lookup". Until then, in
+    v0.1 supply the subscription JSON in <code>Addresses</code> as
+    well:
+  </p>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d "$(jq -n --argjson sub "$WEBPUSH_SUB_JSON" '{
+    tenantId: "acme",
+    notificationId: "msg-9001",
+    userIds: ["user-alice"],
+    channels: ["DELIVERY_CHANNEL_WEB_PUSH"],
+    title: "New comment",
+    body: "Bob commented on Task 42",
+    addresses: { "user-alice": { byChannel: { web_push: ($sub|tostring) } } }
+  }')"`} lang="bash" />
+
+  <h2>Mobile push (FCM) — full round-trip</h2>
+
+  <h3>1. Set up FCM on the server</h3>
+  <Code code={`# Download a service-account JSON from Firebase Console → Project Settings → Service accounts.
+# Pass it to notify as a single env var.
+NOTIFY_MOBILEPUSH_PROVIDER=fcm
+NOTIFY_FCM_PROJECT_ID=my-firebase-project
+NOTIFY_FCM_CREDENTIALS_JSON="$(cat ./service-account.json)"`} lang="bash" />
+
+  <h3>2. Android client — register the FCM token</h3>
+  <Code code={`// build.gradle.kts
+// implementation("com.google.firebase:firebase-messaging:24.0.0")
+
+import com.google.firebase.messaging.FirebaseMessaging
+
+class NotifyTokenManager(private val notifyApi: NotifyApi) {
+
+    fun registerOnStartup() {
+        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+            if (!task.isSuccessful) {
+                Log.w("notify", "FCM token fetch failed", task.exception)
+                return@addOnCompleteListener
+            }
+            val token = task.result
+            notifyApi.registerPushToken(
+                RegisterPushTokenRequest(
+                    deviceType = DeviceType.DEVICE_TYPE_ANDROID,
+                    token = token,
+                )
+            )
+        }
+    }
+}
+
+// Token rotation — implement onNewToken so an OS-side token roll
+// re-registers automatically.
+class NotifyMessagingService : FirebaseMessagingService() {
+    override fun onNewToken(token: String) {
+        super.onNewToken(token)
+        notifyApi.registerPushToken(
+            RegisterPushTokenRequest(
+                deviceType = DeviceType.DEVICE_TYPE_ANDROID,
+                token = token,
+            )
+        )
+    }
+}`} lang="kotlin" />
+
+  <h3>3. iOS client — register the FCM token</h3>
+  <Code code={`import Firebase
+import FirebaseMessaging
+import UIKit
+
+class AppDelegate: UIResponder, UIApplicationDelegate, MessagingDelegate {
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        FirebaseApp.configure()
+        Messaging.messaging().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { _, _ in }
+        application.registerForRemoteNotifications()
+        return true
+    }
+
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let token = fcmToken else { return }
+        notifyApi.registerPushToken(
+            deviceType: .ios,
+            token: token,
+        )
+    }
+}`} lang="swift" />
+
+  <h3>4. Producer-side send via FCM</h3>
+  <Code code={`curl -sX POST http://notify:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -H "X-Notify-Internal-Token: $NOTIFY_INTERNAL_TOKEN" \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "msg-9001",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_MOBILE_PUSH"],
+    "title": "Bob",
+    "body": "Are you around?",
+    "addresses": {
+      "user-alice": {
+        "byChannel": { "mobile_push": "fzM-zR...:APA91bH..." }
+      }
+    }
+  }'`} lang="bash" />
+
+  <h2>Handling dead tokens</h2>
+  <p>
+    Push tokens go stale — users uninstall apps, browsers unsubscribe,
+    OSes roll tokens. Both providers surface "this token is gone" as a
+    typed error:
+  </p>
+  <ul>
+    <li><strong>Web Push</strong>: <code>webpush.ErrSubscriptionGone</code> on HTTP 410.</li>
+    <li><strong>FCM</strong>: <code>fcm.ErrUnregisteredToken</code> on UNREGISTERED / NOT_FOUND.</li>
+  </ul>
+
+  <p>
+    The provider <em>does not</em> purge the device row itself — that's
+    the orchestrator/caller's job. The recommended shape is to wire a
+    callback on <code>NotifyResponse</code> failures that calls
+    <code>RegisterPushToken</code> with an empty token to delete the
+    row (a follow-up wave will add an explicit
+    <code>DeleteDevice</code> RPC; for now the recommended path is for
+    the failing producer to remove the token from its own consumer
+    user store and stop sending to that channel).
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/channels/web-push">Web Push channel</a></li>
+    <li><a href="/notify/docs/channels/mobile-push">Mobile push channel</a></li>
+    <li><a href="/notify/docs/api-reference/grpc#registerpushtoken">API Reference: RegisterPushToken</a></li>
+  </ul>
+</DocsLayout>

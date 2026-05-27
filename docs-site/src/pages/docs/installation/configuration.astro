@@ -1,0 +1,161 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Configuration">
+  <h1>Configuration</h1>
+  <p>
+    Every container option is set via a <code>NOTIFY_*</code> environment
+    variable. <code>cmd/notifyd</code> calls
+    <code>server.LoadConfigFromEnv()</code> on boot; invalid values
+    (negative ports, missing required fields, unknown enums) fail fast
+    with a descriptive error so production never silently runs
+    misconfigured.
+  </p>
+
+  <h2>When you'd care</h2>
+  <p>
+    You're standing up a deployment, debugging a startup error, or moving
+    a provider configuration from one environment to another. The table
+    below is the full surface — there are no hidden flags.
+  </p>
+
+  <h2>Core ports + lifecycle</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_CLIENT_PORT</code></td><td>int</td><td><code>8080</code></td><td>Public Connect/HTTP/2 listener (<code>NotificationClientService</code>).</td></tr>
+    <tr><td><code>NOTIFY_INTERNAL_PORT</code></td><td>int</td><td><code>8081</code></td><td>Private gRPC listener (<code>NotificationInternalService</code>).</td></tr>
+    <tr><td><code>NOTIFY_METRICS_PORT</code></td><td>int</td><td><code>9090</code></td><td><code>/healthz</code> + <code>/metrics</code> listener.</td></tr>
+    <tr><td><code>NOTIFY_LOG_LEVEL</code></td><td>enum</td><td><code>info</code></td><td><code>debug</code> · <code>info</code> · <code>warn</code> · <code>error</code>.</td></tr>
+    <tr><td><code>NOTIFY_SHUTDOWN_TIMEOUT</code></td><td>duration</td><td><code>30s</code></td><td>Graceful-shutdown deadline (Go duration syntax: <code>30s</code>, <code>2m</code>, etc.).</td></tr>
+    <tr><td><code>NOTIFY_ALLOWED_ORIGINS</code></td><td>csv</td><td>—</td><td>Comma-separated CORS origins for the client listener.</td></tr>
+  </table>
+
+  <h2>Store driver</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_STORE_DRIVER</code></td><td>enum</td><td><code>memory</code></td><td><code>memory</code> · <code>postgres</code> · <code>entdb</code>.</td></tr>
+    <tr><td><code>NOTIFY_POSTGRES_DSN</code></td><td>string</td><td>—</td><td>Required when driver=postgres. libpq-style URL.</td></tr>
+    <tr><td><code>NOTIFY_POSTGRES_AUTOMIGRATE</code></td><td>bool</td><td><code>true</code></td><td>Apply pending migrations on connect.</td></tr>
+    <tr><td><code>NOTIFY_ENTDB_ADDRESS</code></td><td>string</td><td>—</td><td>Required when driver=entdb. <code>host:port</code>.</td></tr>
+    <tr><td><code>NOTIFY_ENTDB_TENANT_ID</code></td><td>string</td><td>—</td><td>Required when driver=entdb. EntDB tenant id (the storage shard).</td></tr>
+  </table>
+
+  <h2>Authentication</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_AUTH_JWT_SECRET</code></td><td>string</td><td>—</td><td>HS256 verification key. Required unless dev mode.</td></tr>
+    <tr><td><code>NOTIFY_AUTH_JWT_ISSUER</code></td><td>string</td><td>—</td><td>Pinned <code>iss</code> claim, if set.</td></tr>
+    <tr><td><code>NOTIFY_AUTH_JWT_AUDIENCE</code></td><td>string</td><td>—</td><td>Pinned <code>aud</code> claim, if set.</td></tr>
+    <tr><td><code>NOTIFY_AUTH_JWT_LEEWAY</code></td><td>duration</td><td><code>30s</code></td><td>Allowed clock skew when validating <code>exp</code> / <code>nbf</code>.</td></tr>
+    <tr><td><code>NOTIFY_INTERNAL_TOKEN</code></td><td>string</td><td>—</td><td>Shared secret for <code>X-Notify-Internal-Token</code>. Required unless dev mode.</td></tr>
+    <tr><td><code>NOTIFY_AUTH_DEV_MODE</code></td><td>bool</td><td><code>false</code></td><td>Accepts <code>Bearer dev:&lt;uid&gt;:&lt;tenant&gt;</code>. Local-dev only.</td></tr>
+  </table>
+
+  <p>See <a href="/notify/docs/concepts/auth-model">Auth Model</a> for the full validation flow.</p>
+
+  <h2>Live connections (in-app subsystem)</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_LIVE_CONNECTIONS_ENABLED</code></td><td>bool</td><td><code>true</code></td><td>When false, <code>StreamEvents</code> returns <code>Unimplemented</code>.</td></tr>
+    <tr><td><code>NOTIFY_LIVE_HEARTBEAT_INTERVAL</code></td><td>duration</td><td><code>30s</code></td><td>Per-connection heartbeat cadence.</td></tr>
+    <tr><td><code>NOTIFY_LIVE_RETRY_MAX_ATTEMPTS</code></td><td>int</td><td><code>3</code></td><td>At-least-once retry budget for data-change events. <code>0</code> disables.</td></tr>
+    <tr><td><code>NOTIFY_LIVE_RETRY_INTERVAL</code></td><td>duration</td><td><code>5s</code></td><td>Interval between retry attempts.</td></tr>
+  </table>
+
+  <h2>Email channel</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_EMAIL_PROVIDER</code></td><td>enum</td><td><code>none</code></td><td><code>none</code> · <code>emailservice</code> (others land in later waves).</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_FROM</code></td><td>string</td><td>—</td><td>Default From address. Required when a provider is set.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_SERVICE_ADDRESS</code></td><td>string</td><td>—</td><td><code>host:port</code> of the elloloop EmailService. Required for <code>emailservice</code>.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_SMTP_HOST</code></td><td>string</td><td>—</td><td>SMTP relay host (future SMTP provider).</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_SMTP_PORT</code></td><td>int</td><td>—</td><td>SMTP port.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_SMTP_USERNAME</code></td><td>string</td><td>—</td><td>SMTP username.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_SMTP_PASSWORD</code></td><td>string</td><td>—</td><td>SMTP password.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_API_KEY</code></td><td>string</td><td>—</td><td>API key for SES/SendGrid/ACS providers.</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_REGION</code></td><td>string</td><td>—</td><td>Provider region (SES).</td></tr>
+    <tr><td><code>NOTIFY_EMAIL_ENDPOINT</code></td><td>string</td><td>—</td><td>Provider endpoint override.</td></tr>
+  </table>
+
+  <h2>SMS &amp; WhatsApp (Twilio)</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_SMS_PROVIDER</code></td><td>enum</td><td>—</td><td><code>twilio</code> (others land later).</td></tr>
+    <tr><td><code>NOTIFY_SMS_ACCOUNT_SID</code></td><td>string</td><td>—</td><td>Twilio Account SID. Required when provider=twilio.</td></tr>
+    <tr><td><code>NOTIFY_SMS_AUTH_TOKEN</code></td><td>string</td><td>—</td><td>Twilio Auth Token. Required when provider=twilio.</td></tr>
+    <tr><td><code>NOTIFY_SMS_MESSAGING_SERVICE_SID</code></td><td>string</td><td>—</td><td>Optional Twilio Messaging Service SID.</td></tr>
+    <tr><td><code>NOTIFY_SMS_FROM</code></td><td>string</td><td>—</td><td>E.164 sender (e.g. <code>+15555550000</code>).</td></tr>
+    <tr><td><code>NOTIFY_WHATSAPP_PROVIDER</code></td><td>enum</td><td>—</td><td><code>twilio</code>.</td></tr>
+    <tr><td><code>NOTIFY_WHATSAPP_ACCOUNT_SID</code></td><td>string</td><td>—</td><td>Required when provider=twilio.</td></tr>
+    <tr><td><code>NOTIFY_WHATSAPP_AUTH_TOKEN</code></td><td>string</td><td>—</td><td>Required when provider=twilio.</td></tr>
+    <tr><td><code>NOTIFY_WHATSAPP_FROM</code></td><td>string</td><td>—</td><td>E.164 sender; the <code>whatsapp:</code> prefix is added automatically.</td></tr>
+  </table>
+
+  <h2>Web Push (VAPID)</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_WEBPUSH_PROVIDER</code></td><td>enum</td><td>—</td><td><code>vapid</code>.</td></tr>
+    <tr><td><code>NOTIFY_WEBPUSH_VAPID_PUBLIC</code></td><td>string</td><td>—</td><td>VAPID public key (base64url).</td></tr>
+    <tr><td><code>NOTIFY_WEBPUSH_VAPID_PRIVATE</code></td><td>string</td><td>—</td><td>VAPID private key (base64url).</td></tr>
+    <tr><td><code>NOTIFY_WEBPUSH_CONTACT_EMAIL</code></td><td>string</td><td>—</td><td>Contact email for the push service (RFC 8292).</td></tr>
+  </table>
+
+  <h2>Mobile push (FCM / APNs)</h2>
+  <table>
+    <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NOTIFY_MOBILEPUSH_PROVIDER</code></td><td>enum</td><td>—</td><td><code>fcm</code> (others land later).</td></tr>
+    <tr><td><code>NOTIFY_FCM_CREDENTIALS_JSON</code></td><td>string</td><td>—</td><td>Service-account JSON. Required for FCM.</td></tr>
+    <tr><td><code>NOTIFY_FCM_PROJECT_ID</code></td><td>string</td><td>—</td><td>Firebase project id. Required for FCM.</td></tr>
+    <tr><td><code>NOTIFY_APNS_KEY_P8</code></td><td>string</td><td>—</td><td>APNs auth key (P8 PEM).</td></tr>
+    <tr><td><code>NOTIFY_APNS_KEY_ID</code></td><td>string</td><td>—</td><td>APNs key id.</td></tr>
+    <tr><td><code>NOTIFY_APNS_TEAM_ID</code></td><td>string</td><td>—</td><td>Apple developer team id.</td></tr>
+    <tr><td><code>NOTIFY_APNS_TOPIC</code></td><td>string</td><td>—</td><td>Bundle id / topic.</td></tr>
+    <tr><td><code>NOTIFY_APNS_SANDBOX</code></td><td>bool</td><td><code>false</code></td><td>Use the APNs sandbox endpoint.</td></tr>
+  </table>
+
+  <h2>Minimal production env file</h2>
+  <Code code={`# notify.env
+NOTIFY_STORE_DRIVER=postgres
+NOTIFY_POSTGRES_DSN=postgres://notify:notify@db.internal:5432/notify?sslmode=require
+NOTIFY_AUTH_JWT_SECRET=<32-byte hex>
+NOTIFY_INTERNAL_TOKEN=<32-byte hex>
+NOTIFY_LOG_LEVEL=info
+NOTIFY_ALLOWED_ORIGINS=https://app.example.com
+
+# Email via the elloloop EmailService container.
+NOTIFY_EMAIL_PROVIDER=emailservice
+NOTIFY_EMAIL_SERVICE_ADDRESS=emailservice.internal:50053
+NOTIFY_EMAIL_FROM=noreply@example.com
+
+# SMS via Twilio.
+NOTIFY_SMS_PROVIDER=twilio
+NOTIFY_SMS_ACCOUNT_SID=AC...
+NOTIFY_SMS_AUTH_TOKEN=...
+NOTIFY_SMS_FROM=+15555550000`} lang="ini" title="notify.env" />
+
+  <p>Use it with:</p>
+  <Code code={`docker run --env-file ./notify.env --rm \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  ghcr.io/elloloop/notify:0.1.0`} lang="bash" />
+
+  <h2>Boot-time validation</h2>
+  <p>
+    On startup notify validates every value. Examples of what it catches:
+  </p>
+  <ul>
+    <li><code>NOTIFY_STORE_DRIVER=mongo</code> → "unknown driver \"mongo\" (want memory|postgres|entdb)".</li>
+    <li><code>NOTIFY_STORE_DRIVER=postgres</code> without a DSN → "<code>NOTIFY_POSTGRES_DSN</code> is required when <code>NOTIFY_STORE_DRIVER=postgres</code>".</li>
+    <li><code>NOTIFY_EMAIL_PROVIDER=emailservice</code> without <code>NOTIFY_EMAIL_SERVICE_ADDRESS</code> → required-field error.</li>
+    <li><code>NOTIFY_AUTH_DEV_MODE=false</code> without <code>NOTIFY_AUTH_JWT_SECRET</code> → required-field error.</li>
+    <li><code>NOTIFY_CLIENT_PORT=99999</code> → "<code>NOTIFY_CLIENT_PORT</code>: must be in 1..65535".</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/jwt-keys">JWT Keys</a></li>
+    <li><a href="/notify/docs/installation/store-setup">Store Setup</a></li>
+    <li><a href="/notify/docs/operations/observability">Observability</a></li>
+  </ul>
+</DocsLayout>
