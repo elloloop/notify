@@ -1,0 +1,147 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Auth Model">
+  <h1>Auth Model</h1>
+  <p>
+    notify validates two kinds of credentials, one per service:
+  </p>
+  <ul>
+    <li><strong><code>NotificationClientService</code></strong> (browser / mobile) — <code>Authorization: Bearer &lt;JWT&gt;</code>, HS256 against <code>NOTIFY_AUTH_JWT_SECRET</code>.</li>
+    <li><strong><code>NotificationInternalService</code></strong> (backend producers) — <code>X-Notify-Internal-Token</code>, constant-time compare against <code>NOTIFY_INTERNAL_TOKEN</code>.</li>
+  </ul>
+
+  <h2>When you'd use which</h2>
+  <p>
+    Anything calling <code>Notify</code> (sending a notification) is a
+    backend producer and uses the internal token. Anything streaming a
+    user's own notifications, reading their inbox, marking rows read or
+    registering a push token is the recipient SPA / mobile app and uses
+    a JWT issued for that user.
+  </p>
+
+  <h2>JWT validation (client surface)</h2>
+  <p>
+    The validator is a thin wrapper around <code>github.com/golang-jwt/jwt/v5</code>:
+  </p>
+  <Code code={`type JWTValidator struct {
+    secret   []byte
+    issuer   string
+    audience string
+    leeway   time.Duration
+    now      func() time.Time
+}`} lang="go" />
+
+  <p>Token requirements:</p>
+  <ul>
+    <li><strong>Algorithm</strong> must be HS256. Anything else is rejected (<code>jwt.WithValidMethods</code>).</li>
+    <li><strong><code>sub</code></strong> claim must be a non-empty string. It becomes <code>Claims.UserID</code>.</li>
+    <li><strong><code>tenant</code></strong> (or <code>tenant_id</code>) claim must be a non-empty string. It becomes <code>Claims.TenantID</code>.</li>
+    <li>If <code>NOTIFY_AUTH_JWT_ISSUER</code> is set, the <code>iss</code> claim must match.</li>
+    <li>If <code>NOTIFY_AUTH_JWT_AUDIENCE</code> is set, the <code>aud</code> claim must match.</li>
+    <li><code>exp</code> and <code>nbf</code> are validated with <code>NOTIFY_AUTH_JWT_LEEWAY</code> (default 30s) slack.</li>
+  </ul>
+
+  <p>A valid token results in a typed <code>Claims</code> on the request context:</p>
+  <Code code={`type Claims struct {
+    UserID    string
+    TenantID  string
+    Email     string
+    ExpiresAt time.Time
+}`} lang="go" />
+
+  <p>
+    Handlers read it via <code>ClaimsFromContext(ctx)</code>. The raw
+    <code>jwt.MapClaims</code> is intentionally not exposed — handlers
+    never reach for fields the platform did not promise.
+  </p>
+
+  <h2>Tenant comes from the JWT, never the body</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    Every client-side RPC scopes data by <code>(tenant, user)</code>. If a
+    client could pick the tenant via the request body, a logged-in user
+    could mint requests that read another tenant's data simply by typing
+    a different tenant_id. The platform takes
+    <code>Claims.TenantID</code> from the JWT and ignores any
+    request-body tenant field on the client surface — the producer
+    surface is the only place tenant is supplied via the body, and that
+    surface is internal-token gated.
+  </blockquote>
+
+  <h2>Internal token (producer surface)</h2>
+  <Code code={`func NewInternalAuthInterceptor(expected string, devMode bool) connect.UnaryInterceptorFunc {
+    return func(next connect.UnaryFunc) connect.UnaryFunc {
+        return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+            if expected == "" {
+                if devMode {
+                    return next(ctx, req)
+                }
+                return nil, unauthenticated(errors.New("internal token not configured"))
+            }
+            got := req.Header().Get("X-Notify-Internal-Token")
+            if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+                return nil, unauthenticated(errors.New("internal token mismatch"))
+            }
+            return next(ctx, req)
+        }
+    }
+}`} lang="go" />
+
+  <p>
+    <code>subtle.ConstantTimeCompare</code> avoids the timing side-channel
+    of <code>==</code>. The container refuses to boot with
+    <code>DevMode=false</code> and no <code>NOTIFY_INTERNAL_TOKEN</code>
+    set — there is no "internal calls go unauthenticated" footgun.
+  </p>
+
+  <h2>Dev mode</h2>
+  <p>
+    <code>NOTIFY_AUTH_DEV_MODE=true</code> relaxes the boot-time validation
+    so local development doesn't need a JWT signer:
+  </p>
+  <ul>
+    <li>The client validator accepts <code>Bearer dev:&lt;userid&gt;:&lt;tenant&gt;[:&lt;email&gt;]</code>.</li>
+    <li>The internal interceptor skips the header check when <code>NOTIFY_INTERNAL_TOKEN</code> is also unset.</li>
+  </ul>
+
+  <p>Sample dev tokens:</p>
+  <Code code={`# user-alice in tenant acme
+Authorization: Bearer dev:user-alice:acme
+
+# with an email claim for observability
+Authorization: Bearer dev:user-alice:acme:alice@example.com`} lang="text" />
+
+  <p>
+    <strong>Never enable dev mode in production.</strong> The container
+    rejects boots that try to disable both real auth modes
+    simultaneously.
+  </p>
+
+  <h2>Authorization vs authentication</h2>
+  <p>
+    Authentication answers "is this user who they say they are". notify
+    answers it via JWT verification.
+  </p>
+  <p>
+    Authorization — "may this authenticated user read this row?" — is
+    enforced at the handler boundary by scoping every Store call to
+    <code>(claims.TenantID, claims.UserID)</code>. The standout case is
+    <code>AckNotification</code>: <code>Store.UpdateStatus</code> takes
+    only <code>tenantID</code> + <code>id</code>, not <code>userID</code>,
+    so the handler does a <code>GetNotification(claims.TenantID,
+    claims.UserID, id)</code> first. A cross-user attempt surfaces as
+    <code>ErrNotFound</code>, which maps to <code>CodeNotFound</code> on
+    the wire — never <code>CodePermissionDenied</code>, which would leak
+    the existence of someone else's row.
+  </p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/jwt-keys">JWT Keys</a> — generating and rotating the HS256 secret</li>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a> — every auth env var</li>
+    <li><a href="/notify/docs/api-reference/grpc">API Reference</a> — full RPC table with auth requirements</li>
+  </ul>
+</DocsLayout>

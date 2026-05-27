@@ -1,0 +1,126 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Multi-Tenancy">
+  <h1>Multi-Tenancy</h1>
+  <p>
+    notify carries a <code>tenant_id</code> on every persisted row and
+    every RPC. The model is deliberately lightweight: tenants are an
+    isolation key, not a billing identity or a feature gate.
+  </p>
+
+  <h2>When you'd care</h2>
+  <ul>
+    <li>You run one notify deployment that serves multiple customer organizations and need to keep their data apart.</li>
+    <li>You issue JWTs that already carry a <code>tenant</code> claim and want that to flow through to the inbox.</li>
+    <li>You're using the EntDB driver and want to map notify tenants onto EntDB tenant shards.</li>
+  </ul>
+
+  <h2>Where the tenant id comes from</h2>
+  <p>
+    Two paths, depending on the service:
+  </p>
+  <ul>
+    <li><strong>Producer surface (<code>NotificationInternalService</code>)</strong> — the body's <code>tenant_id</code> field. The internal-token check confirms the caller is trusted; the caller is expected to know which tenant it is acting on behalf of.</li>
+    <li><strong>Client surface (<code>NotificationClientService</code>)</strong> — the JWT's <code>tenant</code> (or <code>tenant_id</code>) claim. The request body has no tenant field at all on these RPCs.</li>
+  </ul>
+
+  <h2>How tenant scoping works in the store</h2>
+  <p>
+    Every Store method that reads or writes carries a <code>tenantID</code>
+    parameter, and every implementation honors it as a hard filter:
+  </p>
+  <ul>
+    <li><code>CreateNotification</code> — the <code>(TenantID, UserID, NotificationID)</code> triple is the uniqueness key. Re-using a notification id under a different tenant produces a new row, not an idempotent hit.</li>
+    <li><code>GetNotification</code> — a row that exists under a different tenant returns <code>ErrNotFound</code>. The same goes for cross-user reads under the same tenant.</li>
+    <li><code>QueryUserNotifications</code> — scoped by <code>(TenantID, UserID)</code>. The cursor and unread count are also scoped.</li>
+    <li><code>UpsertDevice</code> / <code>ListDevices</code> — same shape.</li>
+  </ul>
+
+  <p>
+    The conformance suite exercises this with a dedicated
+    <code>UserIsolation</code> subtest that creates three rows
+    (<code>(acme, u1, x)</code>, <code>(acme, u2, x)</code>,
+    <code>(beta, u1, x)</code>) and asserts that
+    <code>QueryUserNotifications</code> for <code>(acme, u1)</code>
+    returns exactly the first.
+  </p>
+
+  <h2>One deployment, many tenants</h2>
+  <p>
+    Notify is happy to serve many tenants from one container — the
+    tenant id is just data. There is no per-tenant configuration knob
+    today, no per-tenant rate limiting, no per-tenant provider override.
+    Provider configuration is global, and the same providers serve every
+    tenant.
+  </p>
+  <p>
+    If you need per-tenant behaviour (e.g. different SMS sender numbers
+    per customer), the right shape today is library mode: wire one
+    <code>Notifier</code> per tenant with a tenant-specific
+    <code>ProviderRegistry</code> sharing a single underlying
+    <code>Store</code>. The container will grow this as a follow-up wave;
+    until then library mode owns the customization story.
+  </p>
+
+  <h2>EntDB driver and tenant shards</h2>
+  <p>
+    EntDB itself is tenant-sharded. The notify EntDB driver maps onto a
+    single EntDB tenant per process via <code>NOTIFY_ENTDB_TENANT_ID</code>:
+  </p>
+  <Code code={`-e NOTIFY_STORE_DRIVER=entdb \\
+-e NOTIFY_ENTDB_ADDRESS=entdb:50051 \\
+-e NOTIFY_ENTDB_TENANT_ID=notify-prod`} lang="bash" />
+
+  <p>
+    Inside notify's logical model, you can still serve many tenants over
+    that one EntDB shard — they all live under the same EntDB tenant,
+    differentiated by the <code>tenant_id</code> field on each row. The
+    EntDB tenant is the storage shard; the notify tenant is the
+    application-level isolation key.
+  </p>
+
+  <p>
+    Operationally large customers may want a dedicated EntDB shard per
+    customer. The shape is to run a notify container per shard,
+    pointing each at its dedicated <code>NOTIFY_ENTDB_TENANT_ID</code>.
+  </p>
+
+  <h2>Postgres driver and tenant scoping</h2>
+  <p>
+    The Postgres schema carries <code>tenant_id</code> as a column on
+    both tables. Every WHERE clause includes it; every UNIQUE constraint
+    starts with it. There is no Postgres-level row security or schema
+    fan-out — the application-level filter is the contract.
+  </p>
+
+  <Code code={`-- Composite uniqueness keyed on tenant.
+CREATE UNIQUE INDEX notify_notifications_tenant_user_nid_uq
+  ON notify_notifications (tenant_id, user_id, notification_id);
+
+-- Paging index orders within a tenant + user.
+CREATE INDEX notify_notifications_user_created
+  ON notify_notifications (tenant_id, user_id, created_at_ms DESC, id DESC);`} lang="sql" />
+
+  <h2>Cross-tenant operations are intentionally absent</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    There is no "fanout to all tenants" RPC, no "list every tenant"
+    admin endpoint, no global query. The tenant boundary is a hard wall
+    because the auth boundary is — the JWT pins the recipient to one
+    tenant, and the producer surface is per-call tenant-scoped.
+    Cross-tenant operations would either need an admin role concept the
+    platform doesn't model (yet) or a producer with super-user reach
+    that defeats the isolation promise. Neither pays off enough at v0.1
+    to be worth the footgun.
+  </blockquote>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/auth-model">Auth Model</a> — how the JWT supplies the tenant</li>
+    <li><a href="/notify/docs/store/entdb">EntDB driver</a> — schema-aware mode + tenant shards</li>
+    <li><a href="/notify/docs/store/postgres">Postgres driver</a> — schema and tenant scoping</li>
+  </ul>
+</DocsLayout>

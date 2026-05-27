@@ -1,0 +1,154 @@
+---
+import DocsLayout from "../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Quick Start">
+  <h1>Quick Start</h1>
+  <p>
+    Five-minute "Hello, notify": run the container, send a notification
+    from a backend, receive it over SSE in a browser.
+  </p>
+
+  <h2>1. Run notify locally</h2>
+  <p>
+    Use the memory driver and dev-mode auth — no Postgres, no EntDB, no
+    JWT secret. <strong>Never enable dev mode in production.</strong>
+  </p>
+  <Code code={`docker run -d --name notify \\
+  -p 8080:8080 -p 8081:8081 -p 9090:9090 \\
+  -e NOTIFY_AUTH_DEV_MODE=true \\
+  -e NOTIFY_STORE_DRIVER=memory \\
+  ghcr.io/elloloop/notify:latest`} lang="bash" title="docker run" />
+
+  <p>Confirm it's healthy:</p>
+  <Code code={`curl -s http://localhost:9090/healthz
+# {"status":"ok"}`} lang="bash" />
+
+  <h2>2. Send a notification from a backend</h2>
+  <p>
+    Backend producers call the <strong>internal</strong> service on port
+    <code>8081</code>. In dev mode the
+    <code>X-Notify-Internal-Token</code> check is skipped. The request is
+    plain Connect-JSON over HTTP, so cURL works.
+  </p>
+  <Code code={`curl -sX POST http://localhost:8081/elloloop.notify.v1.NotificationInternalService/Notify \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "tenantId": "acme",
+    "notificationId": "n-1",
+    "userIds": ["user-alice"],
+    "channels": ["DELIVERY_CHANNEL_IN_APP"],
+    "subjectRef": "task:42",
+    "subjectType": "task",
+    "title": "New comment",
+    "body": "Bob commented on Task 42"
+  }'`} lang="bash" />
+
+  <p>Response:</p>
+  <Code code={`{"delivered": 0, "pending": 1, "failed": 0}`} lang="json" />
+
+  <p>
+    <code>pending=1</code> is correct: no client is connected yet, so the
+    in-app provider has nowhere to deliver. The row is stored and will
+    surface via <code>GetNotifications</code> or the live stream as soon
+    as a client subscribes.
+  </p>
+
+  <h2>3. Subscribe over SSE in the browser</h2>
+  <p>
+    Client connections go to the <strong>client</strong> service on port
+    <code>8080</code>. The dev-mode token shape is
+    <code>Bearer dev:&lt;userid&gt;:&lt;tenant&gt;</code>.
+  </p>
+  <Code code={`import { createConnectTransport } from "@connectrpc/connect-web";
+import { createClient } from "@connectrpc/connect";
+import { NotificationClientService } from "./gen/notify/v1/notify_pb";
+
+const transport = createConnectTransport({
+  baseUrl: "http://localhost:8080",
+  interceptors: [
+    (next) => async (req) => {
+      req.header.set("Authorization", "Bearer dev:user-alice:acme");
+      return next(req);
+    },
+  ],
+});
+const client = createClient(NotificationClientService, transport);
+
+for await (const ev of client.streamEvents({ deviceType: "DEVICE_TYPE_BROWSER" })) {
+  switch (ev.event.case) {
+    case "notification":
+      console.log("notification:", ev.event.value.notification?.title);
+      break;
+    case "heartbeat":
+      console.log("heartbeat @", ev.event.value.timestampMs);
+      break;
+    case "dataChange":
+      console.log("data change:", ev.event.value.subjectRef);
+      break;
+  }
+}`} lang="ts" title="browser.ts" />
+
+  <p>
+    Now repeat step 2 with a different <code>notificationId</code>: the
+    open stream prints the title within milliseconds.
+  </p>
+
+  <h2>4. Page the inbox history</h2>
+  <p>
+    Anything sent while no client was connected is still available via
+    <code>GetNotifications</code>.
+  </p>
+  <Code code={`curl -sX POST http://localhost:8080/elloloop.notify.v1.NotificationClientService/GetNotifications \\
+  -H 'Authorization: Bearer dev:user-alice:acme' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"limit": 20}'`} lang="bash" />
+
+  <Code code={`{
+  "notifications": [
+    {
+      "id": "...",
+      "notificationId": "n-1",
+      "subjectRef": "task:42",
+      "subjectType": "task",
+      "title": "New comment",
+      "body": "Bob commented on Task 42",
+      "channel": "DELIVERY_CHANNEL_IN_APP",
+      "status": "DELIVERY_STATUS_PENDING",
+      "createdAtMs": "1748390400000"
+    }
+  ],
+  "nextCursor": "",
+  "unreadCount": 1
+}`} lang="json" />
+
+  <h2>5. Mark a notification as read</h2>
+  <Code code={`curl -sX POST http://localhost:8080/elloloop.notify.v1.NotificationClientService/AckNotification \\
+  -H 'Authorization: Bearer dev:user-alice:acme' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"id": "<store-id-from-step-4>"}'`} lang="bash" />
+
+  <p>
+    A repeat <code>GetNotifications</code> shows
+    <code>status: DELIVERY_STATUS_READ</code>,
+    <code>readAtMs</code> stamped, and <code>unreadCount: 0</code>.
+  </p>
+
+  <h2>6. Inspect /metrics</h2>
+  <Code code={`curl -s http://localhost:9090/metrics`} lang="bash" />
+  <p>
+    The endpoint exposes a parseable Prometheus exposition; v0.1 ships
+    a placeholder so scrapers don't 404. Real metric series land in a
+    follow-up wave without changing the route.
+  </p>
+
+  <h2>Next steps</h2>
+  <ul>
+    <li><a href="/notify/docs/installation/configuration">Configuration</a> — every environment variable, defaults, validation rules</li>
+    <li><a href="/notify/docs/installation/jwt-keys">JWT Keys</a> — production-grade HS256 secret</li>
+    <li><a href="/notify/docs/installation/store-setup">Store Setup</a> — Postgres or EntDB driver</li>
+    <li><a href="/notify/docs/examples/send-notification">Send a Notification</a> — Go + Python producer code</li>
+    <li><a href="/notify/docs/examples/subscribe-sse">Subscribe over SSE</a> — full browser/mobile flow</li>
+  </ul>
+</DocsLayout>

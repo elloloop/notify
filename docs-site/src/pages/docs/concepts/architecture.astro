@@ -1,0 +1,155 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro";
+import { Code } from "astro-expressive-code/components";
+---
+
+<DocsLayout title="Architecture">
+  <h1>Architecture</h1>
+  <p>
+    notify is one Go package (<code>github.com/elloloop/notify</code>) that
+    depends on nothing concrete, plus pluggable sub-packages for each
+    backend. The container (<code>cmd/notifyd</code>) is a thin wiring
+    layer; the library mode is the same logic with the wiring deferred to
+    the caller.
+  </p>
+
+  <h2>The orchestrator</h2>
+  <p>
+    <code>notify.Notifier</code> is the orchestrator. It owns a
+    <code>Store</code> and a <code>ProviderRegistry</code> and exposes a
+    single method:
+  </p>
+  <Code code={`type Notifier struct {
+    store     Store
+    providers *ProviderRegistry
+    now       Clock
+}
+
+func (n *Notifier) Notify(ctx context.Context, req NotifyRequest) (NotifyResult, error)`} lang="go" />
+
+  <p>For each <code>(user, channel)</code> the orchestrator:</p>
+  <ol>
+    <li>Builds a <code>Notification</code> row stamped with the request fields.</li>
+    <li>Calls <code>Store.CreateNotification</code> — idempotent on <code>(TenantID, UserID, NotificationID)</code>. A repeat call returns the existing row.</li>
+    <li>Looks up the provider for <code>channel</code> in the registry. If none, increments <code>Pending</code> and continues.</li>
+    <li>Resolves the destination address from <code>req.Addresses</code> (or, for in-app, the user id itself). Missing address ⇒ <code>Pending</code>.</li>
+    <li>Calls <code>Provider.Send</code>. On error, increments <code>Failed</code> and records <code>StatusFailed</code> via <code>UpdateStatus</code>. On success, records the receipt's status (default <code>StatusDelivered</code>).</li>
+  </ol>
+
+  <p>
+    Storage failures abort the whole call. Per-channel delivery failures
+    do not — the fan-out completes and the
+    <code>(delivered, pending, failed)</code> counters surface what
+    happened.
+  </p>
+
+  <h2>The dependency shape</h2>
+  <Code code={`            ┌───────────────────────────────────────┐
+            │       notify (root package)           │
+            │   model.go · store.go · channel.go    │
+            │   notifier.go · config.go             │
+            │                                       │
+            │   Defines: Store, Provider,           │
+            │            Notifier, ChannelKind,     │
+            │            DeliveryStatus, …          │
+            └─────────────┬─────────────────────────┘
+                          │ injected at construction
+                          ▼
+   ┌──────────────────────┴──────────────────────┐
+   │                                             │
+┌──┴───────┐  ┌────────────────┐  ┌──────────────┴─────────┐
+│  Store   │  │ ProviderReg.   │  │   realtime engine      │
+│ (driver) │  │ (one per chan) │  │ (in-app only)          │
+└──────────┘  └────────────────┘  └────────────────────────┘
+ memory          email/...           Registry[T]
+ postgres        twilio/sms          RetryTracker
+ entdb           twilio/whatsapp     Conn[T]
+                 webpush
+                 fcm
+                 (in-app provider)`} lang="text" />
+
+  <p>
+    The root package has no concrete dependencies — it imports only
+    standard library and <code>connect-go</code> (for typed errors). That
+    is what makes it library-mode-friendly: a downstream service can
+    embed <code>Notifier</code> with its own <code>Store</code> and never
+    pull in Twilio or FCM or pgx.
+  </p>
+
+  <h2>The standalone container</h2>
+  <p>
+    <code>cmd/notifyd</code> is the production entry point. It does three
+    things and only three:
+  </p>
+  <ol>
+    <li>Loads <code>server.Config</code> from environment variables.</li>
+    <li>Builds the concrete store / providers per configuration.</li>
+    <li>Hands them to <code>server.New</code> and calls <code>Run</code>.</li>
+  </ol>
+
+  <p>
+    The <code>internal/server</code> package owns the Connect handlers,
+    auth middleware, lifecycle plumbing, and the in-app provider that
+    bridges the realtime engine. It depends on the root package
+    (interfaces), the generated proto stubs (wire types), and the
+    realtime + store / channel sub-packages — exactly the surface a
+    production deployment wires.
+  </p>
+
+  <h2>Process layout</h2>
+  <Code code={`+---------------------------- notifyd container ----------------------------+
+|                                                                           |
+|   :8081  NotificationInternalService  ─── X-Notify-Internal-Token check   |
+|                          │                                                |
+|                          ▼                                                |
+|   :8080  NotificationClientService  ─── Authorization: Bearer <JWT>       |
+|     · StreamEvents   (SSE / Connect server-stream)                        |
+|     · GetNotifications, AckNotification, AckDataChange                    |
+|     · RegisterPushToken                                                   |
+|                          │                                                |
+|              ┌───────────┴────────────────────────────────┐               |
+|              ▼                                            ▼               |
+|         notify.Notifier ◄────── realtime.Registry / RetryTracker          |
+|              │                  (only when LiveConnections.Enabled)       |
+|              ▼                                                            |
+|         notify.Store                                                      |
+|              │                                                            |
+|              ▼                                                            |
+|   memory · postgres · entdb                                               |
+|                                                                           |
+|   :9090   /healthz · /metrics  (Prometheus exposition)                    |
++---------------------------------------------------------------------------+`} lang="text" />
+
+  <h2>Why two services, not one</h2>
+  <p>
+    The producer surface and the recipient surface have orthogonal auth
+    stories: producers are trusted backend code, recipients are
+    untrusted end users. Splitting them into two Connect services means:
+  </p>
+  <ul>
+    <li>The internal token never touches a browser; the user JWT never reaches a producer.</li>
+    <li>Operators can publish the recipient port behind a CDN/WAF and keep the producer port reachable only from the cluster network — at the listener level, not via middleware that could regress.</li>
+    <li>The schemas evolve independently. Adding a producer-side field never expands the recipient API by accident.</li>
+  </ul>
+
+  <h2>Why notification IDs are caller-supplied</h2>
+  <blockquote>
+    <strong>Why this design.</strong>
+    The platform is idempotent on
+    <code>(tenant_id, user_id, notification_id)</code> because the producer
+    knows when a logical event is "the same one" and the platform does not.
+    Examples: a webhook retry, a Kafka redelivery, an at-least-once event
+    fanout in the producer. If notify generated the id, the producer
+    would either have to send "same logical event" twice (duplicate
+    delivery) or maintain its own dedupe table that mirrors notify's. We
+    push the decision to the source of truth — the producer.
+  </blockquote>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="/notify/docs/concepts/channels-and-providers">Channels &amp; Providers</a> — the channel ↔ provider taxonomy in detail</li>
+    <li><a href="/notify/docs/concepts/store-and-conformance">Store &amp; Conformance</a> — the driver-agnostic spec</li>
+    <li><a href="/notify/docs/concepts/realtime-engine">Realtime Engine</a> — Registry, RetryTracker, Conn</li>
+    <li><a href="/notify/docs/concepts/auth-model">Auth Model</a> — JWT + internal token</li>
+  </ul>
+</DocsLayout>
