@@ -29,10 +29,9 @@ import (
 // test — when unset, the test skips so local-dev `go test ./...` stays
 // green without booting EntDB.
 //
-// Each subtest gets a fresh tenant id (process-unique base + atomic
-// counter) so state never leaks between subtests. The shared sdk.DbClient
-// is reused because Connect is expensive and per-tenant isolation is
-// sufficient.
+// Each subtest gets a fresh tenant id (process-unique base + atomic counter)
+// so state never leaks between subtests. The shared sdk.DbClient is reused
+// because Connect is expensive and per-tenant isolation is sufficient.
 func TestConformance(t *testing.T) {
 	addr := os.Getenv("NOTIFY_ENTDB_ADDRESS")
 	if addr == "" {
@@ -40,12 +39,12 @@ func TestConformance(t *testing.T) {
 	}
 
 	// WithSchema enables ADR-031 self-describing writes against
-	// tenant-shard-db v2.0.1. The server materializes the notify schema
-	// from the NAME-FREE descriptor on the first ExecuteAtomic and then
-	// ENFORCES the composite_key unique constraint declared on each
-	// node type in proto/entdb_notify/notify.proto. Without this option
-	// the server runs schemaless and the two Concurrency canaries
-	// (ConcurrentCreate_SameKey_SingleWinner /
+	// tenant-shard-db v2 schema-aware mode. The server materializes the
+	// notify schema from the NAME-FREE descriptor on the first
+	// ExecuteAtomic and then ENFORCES the composite_key unique constraint
+	// declared on each node type in proto/entdb_notify/notify.proto.
+	// Without this option the server runs schemaless and the two
+	// Concurrency canaries (ConcurrentCreate_SameKey_SingleWinner /
 	// ConcurrentUpsertDevice_SameKey_SingleRow) stay red.
 	client, err := sdk.NewClient(addr, sdk.WithSchema(entdbstore.SchemaMessages()...))
 	if err != nil {
@@ -61,35 +60,6 @@ func TestConformance(t *testing.T) {
 	base := fmt.Sprintf("notify-conf-%d", time.Now().UnixNano())
 	var seq int64
 
-	// Schema-fingerprint warm-up: tenant-shard-db v2.0.1's SDK
-	// transport tracks the last server-confirmed schema fingerprint
-	// in an unsynchronized field (grpcTransport.serverFingerprint).
-	// The first ExecuteAtomic against a freshly-booted server takes
-	// the schema-attach branch and writes that field on the response
-	// path; concurrent goroutines all taking that branch trip Go's
-	// race detector (logical outcome is fine — the writes converge
-	// to the same value). Issuing a single serialized warm-up create
-	// here establishes the fingerprint before any concurrent subtest
-	// runs, so the racy field is touched exactly once. This is a
-	// workaround for an UPSTREAM SDK bug — see CONFORMANCE.md.
-	warmTenant := fmt.Sprintf("%s-warmup", base)
-	ensureTenant(t, client, warmTenant)
-	warmStore := entdbstore.New(client, warmTenant)
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if _, err := warmStore.CreateNotification(warmCtx, &notify.Notification{
-		NotificationID: "warmup",
-		TenantID:       warmTenant,
-		UserID:         "warmup-user",
-		Title:          "warmup",
-		Channel:        notify.ChannelInApp,
-		Status:         notify.StatusPending,
-		CreatedAtMS:    time.Now().UnixMilli(),
-	}); err != nil {
-		warmCancel()
-		t.Fatalf("schema-fingerprint warm-up create: %v", err)
-	}
-	warmCancel()
-
 	conformance.RunConformance(t, conformance.Driver{
 		Name: "entdb",
 		New: func(t *testing.T) notify.Store {
@@ -104,16 +74,15 @@ func TestConformance(t *testing.T) {
 
 // ensureTenant registers a tenant in the global registry before any
 // tenant-scoped write. tenant-shard-db v1.12+ enforces explicit tenant
-// registration — an unregistered tenant id returns NOT_FOUND on any
-// write.
+// registration — an unregistered tenant id returns NOT_FOUND on any write.
 func ensureTenant(t *testing.T, client *sdk.DbClient, tenantID string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	admin := client.Admin()
 	if _, err := admin.CreateTenant(ctx, "system:notify", tenantID, tenantID); err != nil {
-		// Treat ALREADY_EXISTS as success — the helper is idempotent
-		// to keep test boot resilient across reruns.
+		// Treat ALREADY_EXISTS as success — the helper is idempotent to
+		// keep test boot resilient across reruns.
 		if !isAlreadyExists(err) {
 			t.Fatalf("admin.CreateTenant(%q): %v", tenantID, err)
 		}

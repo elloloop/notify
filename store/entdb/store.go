@@ -3,6 +3,7 @@ package entdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 
@@ -31,10 +32,11 @@ func NewFromClient(c *Client) *Store {
 
 var _ notify.Store = (*Store)(nil)
 
-// notificationToProto converts a notify.Notification to its protobuf
-// representation. ID is intentionally not on the proto — EntDB assigns
-// node ids server-side; the typed payload only carries the
-// caller-supplied NotificationID (idempotency key).
+// notificationToProto / notificationFromProto / deviceToProto / deviceFromProto
+// move data between the notify.Store domain types and the proto-on-the-wire
+// shape. The notification's ID is not on the proto — EntDB assigns node ids
+// server-side; the typed payload only carries the caller-supplied
+// idempotency key (NotificationID).
 func notificationToProto(n *notify.Notification) *pb.UserNotification {
 	if n == nil {
 		return nil
@@ -110,27 +112,21 @@ func deviceFromProto(id string, p *pb.DeviceRegistration) *notify.Device {
 }
 
 // CreateNotification is idempotent on (TenantID, UserID, NotificationID).
-// The driver materializes that triple into a composite_key value and
-// relies on tenant-shard-db v2.0.1's server-enforced unique constraint
-// (declared in proto/entdb_notify/notify.proto and registered via
-// sdk.WithSchema at client construction) to serialize concurrent same-key
-// creates: only one row persists no matter how many goroutines race.
+// The triple is materialized into a composite_key value declared
+// (entdb.field).unique in proto/entdb_notify/notify.proto and enforced
+// server-side by tenant-shard-db v2 schema-aware mode (registered via
+// sdk.WithSchema at client construction).
 //
-// Implementation note. The Go SDK does NOT expose `wait_applied` on
-// Plan.Commit, so the server's ALREADY_EXISTS does not surface as a typed
-// gRPC error to the loser; instead, every racer's Commit "succeeds" with
-// a pre-allocated UUID, and the WAL applier accepts exactly one of those
-// UUIDs (the rest are silently rejected by the schema's unique index).
-// [Client.commitCreateUnique] reconciles this by resolving the canonical
-// row via sdk.GetByKey on composite_key — winner sees pre-allocated id
-// == canonical id (returns created=true); loser sees them differ
-// (returns created=false with the canonical id).
+// Implementation. Submit an optimistic Create + Commit(WithWaitApplied(true))
+// — the server's WAL applier accepts or rejects the row before Commit
+// returns. On success the returned id IS the canonical row id; on a
+// composite-key collision the SDK surfaces a typed *sdk.UniqueConstraintError
+// and we resolve the canonical id via findNotificationByKey.
 //
-// A pre-emptive GetByKey is retained for the warm-path "I'm just calling
-// CreateNotification twice with the same key in sequence" case — it
-// short-circuits the second submit and avoids the extra Commit round
-// trip. The race-safety guarantee comes from the post-commit reconcile,
-// not from this pre-check.
+// This replaces the pre-v2.0.3 query-then-create + post-commit reconciliation
+// pattern (no longer needed now that wait_applied is real — issue #606).
+// Idempotent re-create returns created=false without mutating the stored
+// row; memory's reference Store has the same property.
 func (s *Store) CreateNotification(ctx context.Context, n *notify.Notification) (bool, error) {
 	if n == nil {
 		return false, errors.New("entdb: CreateNotification: nil notification")
@@ -138,31 +134,35 @@ func (s *Store) CreateNotification(ctx context.Context, n *notify.Notification) 
 	ctx = ctxOrBackground(ctx)
 	actor := notifActor(n.UserID)
 
-	key := notificationCompositeKey(n.TenantID, n.UserID, n.NotificationID)
-	existingID, err := s.c.findNotificationByKey(ctx, actor, key)
-	if err != nil {
-		return false, err
-	}
-	if existingID != "" {
-		n.ID = existingID
-		// Idempotent re-create must not mutate the stored row — the
-		// caller's mutated fields stay on the caller's struct but never
-		// reach EntDB. Memory's reference Store has the same property.
-		return false, nil
+	msg := notificationToProto(n)
+	canonicalID, err := s.c.commitCreate(ctx, actor, msg)
+	if err == nil {
+		n.ID = canonicalID
+		return true, nil
 	}
 
-	msg := notificationToProto(n)
-	canonicalID, won, err := s.c.commitCreateUnique(ctx, actor, msg, notifByCompositeKey, key)
-	if err != nil {
+	var uce *sdk.UniqueConstraintError
+	if !errors.As(err, &uce) {
 		return false, err
 	}
-	n.ID = canonicalID
-	return won, nil
+	// Server-enforced unique constraint rejected the write: either a
+	// deliberate re-create with the same idempotency key, or the loser of
+	// a concurrent same-key race. Resolve to the canonical row.
+	key := notificationCompositeKey(n.TenantID, n.UserID, n.NotificationID)
+	existingID, ferr := s.c.findNotificationByKey(ctx, actor, key)
+	if ferr != nil {
+		return false, ferr
+	}
+	if existingID == "" {
+		return false, fmt.Errorf("entdb: unique constraint hit but key %q not resolvable", key)
+	}
+	n.ID = existingID
+	return false, nil
 }
 
-// GetNotification returns the row scoped to (tenantID, userID). Mismatch
-// surfaces as notify.ErrNotFound — the conformance suite asserts cross-user
-// and cross-tenant reads miss.
+// GetNotification returns the row scoped to (tenantID, userID). A mismatch on
+// either field surfaces as notify.ErrNotFound — the UserIsolation conformance
+// subtest asserts cross-user and cross-tenant reads MUST miss.
 func (s *Store) GetNotification(ctx context.Context, tenantID, userID, id string) (*notify.Notification, error) {
 	ctx = ctxOrBackground(ctx)
 	got, err := s.c.getUserNotification(ctx, notifActor(userID), id)
@@ -170,8 +170,8 @@ func (s *Store) GetNotification(ctx context.Context, tenantID, userID, id string
 		return nil, err
 	}
 	if got == nil {
-		// systemActor read so a cross-user query still surfaces as
-		// "not found" rather than as "access denied".
+		// systemActor read so a cross-user query surfaces as "not found"
+		// rather than as "access denied".
 		got, err = s.c.getUserNotification(ctx, systemActor, id)
 		if err != nil {
 			return nil, err
@@ -186,16 +186,21 @@ func (s *Store) GetNotification(ctx context.Context, tenantID, userID, id string
 	return notificationFromProto(id, got), nil
 }
 
-// UpdateStatus sets delivery_status and the timestamp field corresponding
-// to the new status. Uses UpdateFields so a 0 timestamp (e.g. clearing an
-// ack on a re-read) still goes on the wire — proto3 Update would otherwise
-// silently drop a zero-value write.
+// UpdateStatus sets delivery_status and the timestamp field corresponding to
+// the new status. UpdateFields names both fields explicitly so a proto3 zero
+// value (e.g. atMS=0 clearing a timestamp) still goes on the wire — proto3
+// Update would otherwise drop the zero-value write.
+//
+// wait_applied (issue #606) makes the post-commit visibility a non-issue
+// even under concurrent UpdateStatus writers on the same row: each goroutine
+// blocks on its OWN offset, not on a specific value reading back, so the
+// pre-v2.0.4 value-poll deadlock (issue #600) does not apply.
 func (s *Store) UpdateStatus(ctx context.Context, tenantID, id string, status notify.DeliveryStatus, atMS int64) error {
 	ctx = ctxOrBackground(ctx)
 
-	// Look up the row first so (a) we can verify tenant scope and
-	// (b) we can route the write under the row's owning user actor.
-	// systemActor is required because the caller has no userID.
+	// Look up the row first to verify tenant scope and route the write
+	// under the row's owning user actor. systemActor is required because
+	// the caller has no userID.
 	got, err := s.c.getUserNotification(ctx, systemActor, id)
 	if err != nil {
 		return err
@@ -218,37 +223,30 @@ func (s *Store) UpdateStatus(ctx context.Context, tenantID, id string, status no
 		patch.ReadAtMs = atMS
 		fields = append(fields, "read_at_ms")
 	}
-	// wait=false: concurrent UpdateStatus writers on the same row
-	// observe each other's values during the wait window and the
-	// deadline expires even though the write committed. The
-	// conformance ConcurrentUpdateStatus_NoError subtest is the canary
-	// — accepting eventual consistency on the status field is the
-	// pragmatic fix.
-	return s.c.commitUpdateFields(ctx, actor, id, patch, false, fields...)
+	return s.c.commitUpdateFields(ctx, actor, id, patch, fields...)
 }
 
-// QueryUserNotifications pages newest-first via CursorMS, walks past
-// EntDB's per-call row cap (the SDK's auto-follow is on by default in
-// v1.24.0+), and computes unread separately from the page window.
+// QueryUserNotifications pages newest-first via CursorMS, walks past EntDB's
+// per-call row cap via the SDK's v1.24+ keyset auto-follow, and computes
+// unread separately from the page window.
 func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*notify.Notification, string, int, error) {
 	ctx = ctxOrBackground(ctx)
 	limit := notify.ClampLimit(q.Limit)
 
-	// systemActor read so the suite's UserIsolation subtest, which
-	// queries cross-user, surfaces an empty result rather than
-	// ACCESS_DENIED. The transport-level WHERE filter scopes to the
-	// exact user.
+	// systemActor read so UserIsolation's cross-user query surfaces as
+	// empty rather than ACCESS_DENIED. The transport-level WHERE filter
+	// scopes to the exact user; a defensive post-filter below catches any
+	// stale-shard read.
 	nodes, err := s.c.queryUserNotifications(ctx, systemActor, q.TenantID, q.UserID)
 	if err != nil {
 		return nil, "", 0, err
 	}
 
-	// The transport returns the Node (payload struct), but our typed
-	// reader rehydrates each entry via sdk.Get against the node id.
-	// That extra hop is unavoidable: the typed wire format and the
-	// raw transport's structpb shape are NOT 1:1 for fields whose
-	// proto kind doesn't survive structpb (notably int64 above 2^53),
-	// so we re-read via the typed path to preserve fidelity.
+	// The raw transport returns the Node (id + payload struct), but we
+	// rehydrate each entry via sdk.Get against the node id. That extra
+	// hop preserves wire fidelity for fields whose proto kind structpb
+	// historically mangled (notably int64 above 2^53); v2's EntValue wire
+	// path closes that bug class but the typed read is still belt-and-braces.
 	rows := make([]*notify.Notification, 0, len(nodes))
 	unread := 0
 	for _, node := range nodes {
@@ -259,9 +257,6 @@ func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*
 		if msg == nil {
 			continue
 		}
-		// Defensive: the transport's WHERE filter already scopes to
-		// tenant + user, but a stale read could surface mismatched
-		// rows during shard rebalances. Drop anything off-scope.
 		if msg.GetTenantId() != q.TenantID || msg.GetUserId() != q.UserID {
 			continue
 		}
@@ -277,8 +272,8 @@ func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*
 		rows = append(rows, notificationFromProto(id, msg))
 	}
 
-	// Newest-first; tiebreak on id so subtests with identical
-	// CreatedAtMS see a stable order.
+	// Newest-first; tiebreak on id so subtests with identical CreatedAtMS
+	// see a stable order.
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].CreatedAtMS != rows[j].CreatedAtMS {
 			return rows[i].CreatedAtMS > rows[j].CreatedAtMS
@@ -294,17 +289,19 @@ func (s *Store) QueryUserNotifications(ctx context.Context, q notify.Query) ([]*
 	return rows, nextCursor, unread, nil
 }
 
-// UpsertDevice inserts a new device row or updates the token /
-// last_active_ms timestamps on the existing row keyed by (TenantID,
-// UserID, DeviceType). With tenant-shard-db v2.0.1's server-enforced
-// composite_key unique constraint, concurrent racers with the same key
-// produce exactly one row: the winner persists, every loser's Create is
-// silently rejected by the WAL applier, and the loser's submitted-but-
-// not-persisted UUID is reconciled against the canonical row via
-// [Client.commitCreateUnique]. The loser then runs UpdateFields against
-// the canonical id, preserving the "last write wins token rotation"
-// semantics memory's Store models — racers all observe the same
-// canonical row at the end of the dust-up.
+// UpsertDevice inserts a new device row or, when one already exists for the
+// composite key (TenantID, UserID, DeviceType), rotates the token and
+// last_active_ms on the canonical row.
+//
+// Implementation. Submit an optimistic Create + Commit(WithWaitApplied(true)).
+// First-time inserts succeed and we read the row back. A composite-key
+// collision (idempotent re-register, or a concurrent race-loser) surfaces
+// as *sdk.UniqueConstraintError; the handler resolves the canonical id via
+// findDeviceByKey and rotates the token + last_active_ms via
+// commitUpdateFields. Race-losers may stack their rotations against the
+// same canonical id; wait_applied means each rotation lands at its own
+// commit offset and the final state converges on whichever applier-batch
+// landed last (memory's reference is also last-write-wins).
 func (s *Store) UpsertDevice(ctx context.Context, d *notify.Device) (*notify.Device, error) {
 	if d == nil {
 		return nil, errors.New("entdb: UpsertDevice: nil device")
@@ -312,94 +309,57 @@ func (s *Store) UpsertDevice(ctx context.Context, d *notify.Device) (*notify.Dev
 	ctx = ctxOrBackground(ctx)
 	actor := notifActor(d.UserID)
 
+	canonicalID, err := s.c.commitCreate(ctx, actor, deviceToProto(d))
+	if err == nil {
+		// First-time insert: the values we just sent ARE the row.
+		d.ID = canonicalID
+		return s.readDeviceBack(ctx, actor, canonicalID, d)
+	}
+
+	var uce *sdk.UniqueConstraintError
+	if !errors.As(err, &uce) {
+		return nil, err
+	}
+	// Existing row for this composite key — rotate token + last_active_ms.
 	key := deviceCompositeKey(d.TenantID, d.UserID, d.DeviceType)
-
-	// Fast path: a pre-existing row for this composite key is just a
-	// rotate-in-place update. This is the warm path memory hits and
-	// the single-threaded DeviceUpsertRotation subtest exercises;
-	// wait=true gives strict read-your-writes against the rotated
-	// token.
-	existingID, err := s.c.findDeviceByKey(ctx, actor, key)
-	if err != nil {
-		return nil, err
+	existingID, ferr := s.c.findDeviceByKey(ctx, actor, key)
+	if ferr != nil {
+		return nil, ferr
 	}
-	if existingID != "" {
-		return s.rotateDeviceToken(ctx, actor, existingID, d, true)
+	if existingID == "" {
+		return nil, fmt.Errorf("entdb: UpsertDevice: unique constraint hit but key %q not resolvable", key)
 	}
-
-	// Cold path: submit a Create. Multiple racers may submit at once;
-	// the server's unique-index check accepts exactly one. The loser
-	// learns its canonical id via the unique-key reconcile, then runs
-	// the same rotate-in-place update against it. This preserves
-	// "every UpsertDevice for the same key sees a single row" against
-	// arbitrary write concurrency.
-	msg := deviceToProto(d)
-	canonicalID, won, err := s.c.commitCreateUnique(ctx, actor, msg, deviceByCompositeKey, key)
-	if err != nil {
-		return nil, err
-	}
-	if !won {
-		// Lost the create race. The canonical row holds whatever fields
-		// the winner wrote; this caller's token / last_active_ms still
-		// need to land so memory's "last writer wins" semantics survive
-		// the loss. wait=false here because the racing-losers path runs
-		// N concurrent rotates against the same canonical id and each
-		// loser's post-commit poll would observe a different goroutine's
-		// values; the writes themselves all commit and the final state
-		// converges on whichever applier-batch landed last.
-		return s.rotateDeviceToken(ctx, actor, canonicalID, d, false)
-	}
-	d.ID = canonicalID
-	got, gerr := s.c.getDevice(ctx, actor, canonicalID)
-	if gerr != nil {
-		return nil, gerr
-	}
-	if got == nil {
-		// Reconcile said the row exists but a follow-up Get could not
-		// see it — surface the input as-is so the caller at least has
-		// the canonical id and the values it wrote.
-		return &notify.Device{
-			ID:           canonicalID,
-			TenantID:     d.TenantID,
-			UserID:       d.UserID,
-			DeviceType:   d.DeviceType,
-			Token:        d.Token,
-			CreatedAtMS:  d.CreatedAtMS,
-			LastActiveMS: d.LastActiveMS,
-		}, nil
-	}
-	return deviceFromProto(canonicalID, got), nil
-}
-
-// rotateDeviceToken applies a token + last_active_ms patch on the
-// canonical device row and returns the post-update view. The patch
-// names both fields explicitly so a 0 LastActiveMS still writes
-// (proto3 Update drops zero values without an explicit field list).
-//
-// The wait argument controls the post-commit read-your-writes loop.
-// Pass true on the fast path (single caller rotating an existing row —
-// the DeviceUpsertRotation subtest wants strict RYW). Pass false on the
-// race-loser path where N concurrent rotates target the same canonical
-// id and the loop would observe whichever racer's values landed last,
-// timing out even though every write committed (matches the pattern
-// UpdateStatus uses to escape its own ConcurrentUpdateStatus_NoError
-// canary).
-func (s *Store) rotateDeviceToken(ctx context.Context, actor, deviceID string, d *notify.Device, wait bool) (*notify.Device, error) {
 	patch := &pb.DeviceRegistration{
 		Token:        d.Token,
 		LastActiveMs: d.LastActiveMS,
 	}
-	if err := s.c.commitUpdateFields(ctx, actor, deviceID, patch, wait, "token", "last_active_ms"); err != nil {
+	if err := s.c.commitUpdateFields(ctx, actor, existingID, patch, "token", "last_active_ms"); err != nil {
 		return nil, err
 	}
-	got, gerr := s.c.getDevice(ctx, actor, deviceID)
-	if gerr != nil {
-		return nil, gerr
+	return s.readDeviceBack(ctx, actor, existingID, d)
+}
+
+// readDeviceBack does the post-mutate Get used by UpsertDevice. On a
+// vanished-row sentinel it falls back to a synthesized device built from
+// the caller's input + the canonical id — the caller at least gets the id
+// and the values they just wrote.
+func (s *Store) readDeviceBack(ctx context.Context, actor, id string, fallback *notify.Device) (*notify.Device, error) {
+	got, err := s.c.getDevice(ctx, actor, id)
+	if err != nil {
+		return nil, err
 	}
 	if got == nil {
-		return nil, errors.New("entdb: UpsertDevice: row vanished after update")
+		return &notify.Device{
+			ID:           id,
+			TenantID:     fallback.TenantID,
+			UserID:       fallback.UserID,
+			DeviceType:   fallback.DeviceType,
+			Token:        fallback.Token,
+			CreatedAtMS:  fallback.CreatedAtMS,
+			LastActiveMS: fallback.LastActiveMS,
+		}, nil
 	}
-	return deviceFromProto(deviceID, got), nil
+	return deviceFromProto(id, got), nil
 }
 
 // ListDevices returns every device row for a user, ordered by device type
