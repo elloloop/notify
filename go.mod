@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	connectrpc.com/connect v1.19.2
 	github.com/SherClockHolmes/webpush-go v1.4.0
-	github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2 v2.0.2
+	github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2 v2.0.5
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/testcontainers/testcontainers-go v0.42.0
