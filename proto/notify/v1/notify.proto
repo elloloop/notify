@@ -1,0 +1,244 @@
+// elloloop/notify — Connect/gRPC service contract.
+//
+// Two services live here:
+//
+//   NotificationInternalService — backend-to-backend, gRPC. Producers (any
+//     consumer service, e.g. a todo / messaging / billing backend) call
+//     Notify to fan a payload out to one-or-many users across one-or-many
+//     delivery channels. The platform stores per-user rows idempotently and
+//     attempts immediate delivery wherever a provider + destination is
+//     available.
+//
+//   NotificationClientService — client-facing (browser / mobile), Connect
+//     HTTP/2. Recipients stream live events, page their inbox, ack/read
+//     deliveries, ack downstream data-change hints, and register push
+//     tokens. This surface is what the SPA / mobile app talks to.
+//
+// Authentication is intentionally out of scope for the proto and is carried
+// at the transport layer (`Authorization: Bearer <JWT>`). The platform
+// validates against elloloop/identity directly — never via a consumer hop.
+//
+// Proto field numbers and enum values in this file are STABLE FOREVER once
+// allocated. Add fields freely; never reuse, renumber, or remove.
+
+syntax = "proto3";
+
+package elloloop.notify.v1;
+
+// The proto file lives at proto/notify/v1/notify.proto; with
+// `paths=source_relative` in buf.gen.yaml the generated Go lands at
+// gen/go/notify/v1/. The `notifyv1` alias keeps the Go import name flat.
+option go_package = "github.com/elloloop/notify/gen/go/notify/v1;notifyv1";
+
+// ─── Enums ────────────────────────────────────────────────────────────
+
+// DeliveryChannel is the wire-stable identifier for one delivery rail.
+// The string form used in NotifyRequest.addresses keys is the lowercase
+// suffix ("email", "sms", "whatsapp", "mobile_push", "web_push"). In-app
+// has no address — destination is the user id itself.
+enum DeliveryChannel {
+  DELIVERY_CHANNEL_UNSPECIFIED = 0;
+  DELIVERY_CHANNEL_IN_APP      = 1;
+  DELIVERY_CHANNEL_EMAIL       = 2;
+  DELIVERY_CHANNEL_WEB_PUSH    = 3;
+  DELIVERY_CHANNEL_MOBILE_PUSH = 4;
+  DELIVERY_CHANNEL_SMS         = 5;
+  DELIVERY_CHANNEL_WHATSAPP    = 6;
+}
+
+// DeliveryStatus tracks one (user, notification, channel) row through its
+// lifecycle. PENDING means stored but not yet handed to a provider (no
+// destination or no active provider). DELIVERED means the provider accepted
+// the message. ACKED is a transport-level confirmation (e.g. push receipt).
+// READ is recipient-driven. FAILED is provider rejection.
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_PENDING     = 1;
+  DELIVERY_STATUS_DELIVERED   = 2;
+  DELIVERY_STATUS_ACKED       = 3;
+  DELIVERY_STATUS_READ        = 4;
+  DELIVERY_STATUS_FAILED      = 5;
+}
+
+// DeviceType disambiguates the runtime issuing a stream / registering a
+// push token. The platform supports at most one registered token per
+// (user, device_type) — re-registering replaces the previous token.
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  DEVICE_TYPE_BROWSER     = 1;
+  DEVICE_TYPE_ANDROID     = 2;
+  DEVICE_TYPE_IOS         = 3;
+}
+
+// ─── NotificationInternalService ──────────────────────────────────────
+//
+// Backend-to-backend surface. Speaks gRPC. Auth is bearer-token at the
+// transport layer; see file-level comment.
+
+service NotificationInternalService {
+  // Notify creates per-user notification rows and attempts immediate
+  // delivery for every (user, channel) where a provider+destination is
+  // configured. Storage is idempotent on (tenant_id, user_id, notification_id).
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+}
+
+message NotifyRequest {
+  string tenant_id = 1;
+  // Caller idempotency key. The platform stores at most one row per
+  // (tenant_id, user_id, notification_id) — retries with the same id are
+  // safe and do not duplicate deliveries.
+  string notification_id = 2;
+  repeated string user_ids = 3;
+  // Empty channels list = fan out to every channel that has both an
+  // active provider and a destination for the user.
+  repeated DeliveryChannel channels = 4;
+  // Opaque caller reference. The platform NEVER interprets subject_ref or
+  // subject_type — no domain leakage. Clients use these to correlate the
+  // notification back to whatever object lives in their world (a todo, a
+  // chat message, an invoice, …).
+  string subject_ref = 5;
+  string subject_type = 6;
+  string title = 7;
+  string body = 8;
+  // Per-user, per-channel destinations the platform's store doesn't
+  // already hold (e.g. one-off email override, freshly captured phone
+  // number). Outer key = userID. Inner key = channel-name ("email",
+  // "sms", "whatsapp", "mobile_push", "web_push"). In-app needs no entry
+  // — destination is the user id itself.
+  map<string, ChannelAddresses> addresses = 9;
+}
+
+// ChannelAddresses wraps the inner channel→address map so it can be used
+// as a value in NotifyRequest.addresses (proto3 forbids map values that
+// are themselves map types).
+message ChannelAddresses {
+  map<string, string> by_channel = 1;
+}
+
+message NotifyResponse {
+  // Accepted by at least one provider for the (user, channel) row.
+  int32 delivered = 1;
+  // Stored without an active provider or without a known destination.
+  int32 pending = 2;
+  // Provider returned an error.
+  int32 failed = 3;
+}
+
+// ─── NotificationClientService ────────────────────────────────────────
+//
+// Client-facing surface for browsers and mobile apps. Speaks Connect over
+// HTTP/2. Auth is bearer-token at the transport layer; see file-level
+// comment. Tenant is derived from the JWT — never trusted from the body.
+
+service NotificationClientService {
+  // StreamEvents opens a long-lived server-stream that multiplexes new
+  // notifications, downstream data-change hints, and heartbeats over one
+  // connection. The session_id on each event identifies the stream so
+  // AckDataChange can target it.
+  rpc StreamEvents(StreamEventsRequest) returns (stream StreamEvent);
+
+  // GetNotifications pages the user's stored inbox in reverse chronological
+  // order. unread_only filters to status < READ. cursor is opaque and is
+  // round-tripped from the previous response.
+  rpc GetNotifications(GetNotificationsRequest) returns (GetNotificationsResponse);
+
+  // AckNotification marks one stored notification (by store id) as
+  // acknowledged by the recipient. Idempotent — repeated calls are no-ops.
+  rpc AckNotification(AckNotificationRequest) returns (AckNotificationResponse);
+
+  // AckDataChange acknowledges a downstream data-change hint the server
+  // pushed via StreamEvents, removing it from the per-session retry queue.
+  rpc AckDataChange(AckDataChangeRequest) returns (AckDataChangeResponse);
+
+  // RegisterPushToken stores or replaces the push token for the caller's
+  // (user, device_type). At most one token per (user, device_type) — a
+  // second call replaces the first.
+  rpc RegisterPushToken(RegisterPushTokenRequest) returns (RegisterPushTokenResponse);
+}
+
+message StreamEventsRequest {
+  DeviceType device_type = 1;
+}
+
+// StreamEvent is the union envelope server→client. Every event carries
+// the server-assigned session_id so the client can scope acks (e.g.
+// AckDataChange) back to this exact connection.
+message StreamEvent {
+  string session_id = 1;
+  oneof event {
+    NotificationEvent notification = 2;
+    DataChangeEvent   data_change  = 3;
+    HeartbeatEvent    heartbeat    = 4;
+  }
+}
+
+// Notification is the client-facing view of one stored (user, notification,
+// channel) row. id is the platform's store identifier — pass it to
+// AckNotification. notification_id is the producer's idempotency key.
+message Notification {
+  string id = 1;
+  string notification_id = 2;
+  string subject_ref  = 3;
+  string subject_type = 4;
+  string title = 5;
+  string body  = 6;
+  DeliveryChannel channel = 7;
+  DeliveryStatus  status  = 8;
+  int64 created_at_ms = 9;
+  int64 delivered_at_ms = 10;
+  int64 ack_at_ms = 11;
+  int64 read_at_ms = 12;
+}
+
+message NotificationEvent {
+  Notification notification = 1;
+}
+
+// DataChangeEvent is a lightweight hint that something the client cares
+// about may have changed upstream. The platform doesn't ship the new
+// state — clients re-fetch via their own APIs. idempotency_key dedupes
+// retries; subject_ref / subject_type are opaque.
+message DataChangeEvent {
+  string idempotency_key = 1;
+  string subject_ref  = 2;
+  string subject_type = 3;
+}
+
+// HeartbeatEvent keeps idle connections alive and lets the client detect a
+// stalled stream. timestamp_ms is the server clock at emit time.
+message HeartbeatEvent {
+  int64 timestamp_ms = 1;
+}
+
+message GetNotificationsRequest {
+  string cursor = 1;
+  int32 limit = 2;
+  bool unread_only = 3;
+}
+
+message GetNotificationsResponse {
+  repeated Notification notifications = 1;
+  string next_cursor = 2;
+  int32 unread_count = 3;
+}
+
+message AckNotificationRequest {
+  // Store id (Notification.id), NOT the producer's notification_id.
+  string id = 1;
+}
+
+message AckNotificationResponse {}
+
+message AckDataChangeRequest {
+  string idempotency_key = 1;
+  string session_id = 2;
+}
+
+message AckDataChangeResponse {}
+
+message RegisterPushTokenRequest {
+  DeviceType device_type = 1;
+  string token = 2;
+}
+
+message RegisterPushTokenResponse {}

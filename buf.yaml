@@ -8,8 +8,18 @@ lint:
     - STANDARD
   except:
     - PACKAGE_VERSION_SUFFIX
+    # Proto file lives at proto/notify/v1/notify.proto (the contract-stable
+    # path) while the proto package is `elloloop.notify.v1` (the wire-stable
+    # fully-qualified namespace). The directory split is intentional.
+    - PACKAGE_DIRECTORY_MATCH
   ignore:
     - proto/entdb/entdb_options.proto
+  ignore_only:
+    # The streamed envelope is named StreamEvent (not StreamEventsResponse)
+    # because StreamEvents emits a stream of events, not a single response.
+    # This is a deliberate, public-API-shaping choice.
+    RPC_RESPONSE_STANDARD_NAME:
+      - proto/notify/v1/notify.proto
 
 breaking:
   use:
