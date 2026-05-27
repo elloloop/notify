@@ -1,7 +1,13 @@
+# Generated with: buf generate
 version: v2
 
 plugins:
   - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: gen/go
+    opt:
+      - paths=source_relative
+      - Mentdb/entdb_options.proto=github.com/elloloop/notify/gen/go/entdb
+  - remote: buf.build/connectrpc/go:v1.19.0
     out: gen/go
     opt:
       - paths=source_relative
