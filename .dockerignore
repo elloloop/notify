@@ -1,0 +1,16 @@
+# Local-only artifacts; the Dockerfile builds from sources, never from these.
+.git
+.github
+.idea
+.vscode
+*.md
+LICENSE
+docs/
+tests/
+
+# Test-only files are not needed inside the image. `go build ./cmd/notifyd`
+# ignores them anyway, but keeping them out of the build context speeds up
+# multi-arch builds and stops `docker build` from invalidating the cache on
+# every test edit.
+**/*_test.go
+**/testdata/
