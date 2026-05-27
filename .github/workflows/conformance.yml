@@ -1,0 +1,156 @@
+name: Conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+# Cancel in-progress runs for the same ref so PR pushes don't pile up.
+concurrency:
+  group: conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26.3'
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Driver matrix — runs each store driver's conformance suite. The PR
+  # check name "Conformance / <driver>" is what branch protection pins; the
+  # matrix is the single source of truth for which drivers gate the merge.
+  #
+  # Service containers (postgres + entdb) are declared at the job level so
+  # they boot for every entry. The memory test ignores them; postgres uses
+  # testcontainers internally (the service container is also fine to leave
+  # running); entdb uses the localhost listener exposed by the service.
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: Conformance / ${{ matrix.driver }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - driver: memory
+            package: ./store/memory/...
+            build_tag: ""
+            need_postgres: false
+            need_entdb: false
+          - driver: postgres
+            package: ./store/postgres/...
+            build_tag: ""
+            need_postgres: true
+            need_entdb: false
+          - driver: entdb
+            package: ./store/entdb/...
+            build_tag: realentdb
+            need_postgres: false
+            need_entdb: true
+
+    services:
+      postgres:
+        image: postgres:16.13-alpine3.23
+        env:
+          POSTGRES_USER: notify
+          POSTGRES_PASSWORD: notify
+          POSTGRES_DB: notify
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U notify"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      entdb:
+        # tenant-shard-db v1.12+ is a distroless image (no shell/python),
+        # so an in-container --health-cmd cannot spawn. The Go server
+        # ignores env vars (CLI flags only). TCP readiness is polled by
+        # the "Wait for entdb" step below.
+        image: ghcr.io/elloloop/tenant-shard-db:2.0.5
+        ports:
+          - 50051:50051
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Wait for postgres
+        if: matrix.need_postgres
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              echo "postgres up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not come up" >&2
+          exit 1
+
+      - name: Wait for entdb
+        if: matrix.need_entdb
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z localhost 50051; then
+              echo "entdb up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "entdb did not come up" >&2
+          exit 1
+
+      - name: Run conformance suite
+        env:
+          NOTIFY_TEST_POSTGRES_DSN: ${{ matrix.need_postgres && 'postgres://notify:notify@localhost:5432/notify?sslmode=disable' || '' }}
+          NOTIFY_ENTDB_ADDRESS: ${{ matrix.need_entdb && 'localhost:50051' || '' }}
+        run: |
+          set -euo pipefail
+          tag_flag=""
+          if [[ -n "${{ matrix.build_tag }}" ]]; then
+            tag_flag="-tags=${{ matrix.build_tag }}"
+          fi
+          go test ${tag_flag} -race -count=1 -timeout=900s -v ${{ matrix.package }}
+
+  # ---------------------------------------------------------------------------
+  # Unit job — everything outside the driver-specific tree:
+  # core notifier, channels, realtime, the generated proto smoke and the new
+  # internal/server suite. This is the test bed that catches regressions in
+  # the wiring layer between Connect handlers and the orchestrator.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race) — everything except the driver matrix
+        run: |
+          set -euo pipefail
+          go test \
+            -race -count=1 -timeout=600s \
+            $(go list ./... \
+              | grep -vE '/(store/(postgres|entdb))(/|$)')
