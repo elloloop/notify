@@ -22,7 +22,6 @@ import (
 
 	sdk "github.com/elloloop/tenant-shard-db/sdk/go/entdb/v2"
 
-	"github.com/elloloop/notify"
 	"github.com/elloloop/notify/internal/server"
 	"github.com/elloloop/notify/store/entdb"
 	"github.com/elloloop/notify/store/postgres"
@@ -75,8 +74,15 @@ func run() error {
 // buildDependencies returns a server.Dependencies populated for the configured
 // store driver, plus a cleanup function the caller defers.
 //
-// The function returns a non-nil cleanup even on the error path so callers can
-// always defer it — keeps run() shorter and removes a class of leak bugs.
+// The store lifetime is owned by the cleanup function (not by server.Shutdown
+// via Dependencies.StoreCloser) so there is exactly one Close call regardless
+// of where run() exits. server.Shutdown drains the HTTP servers first and
+// returns; cleanup then closes the store after no in-flight Connect handler
+// can still touch it. Passing StoreCloser as well would double-close — pgx
+// pools tolerate it but the entdb SDK historically did not.
+//
+// The function returns a non-nil cleanup even on the error path so callers
+// can always defer it — keeps run() shorter and removes a class of leak bugs.
 func buildDependencies(cfg server.Config) (server.Dependencies, func(), error) {
 	deps := server.Dependencies{
 		Logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.SlogLevel()})),
@@ -99,7 +105,6 @@ func buildDependencies(cfg server.Config) (server.Dependencies, func(), error) {
 			return deps, cleanup, fmt.Errorf("postgres: %w", err)
 		}
 		deps.Store = store
-		deps.StoreCloser = closeFuncStore(func() error { store.Close(); return nil })
 		cleanup = func() { store.Close() }
 		return deps, cleanup, nil
 
@@ -116,18 +121,9 @@ func buildDependencies(cfg server.Config) (server.Dependencies, func(), error) {
 		}
 		store := entdb.New(client, cfg.Store.TenantID)
 		deps.Store = store
-		deps.StoreCloser = closeFuncStore(func() error { return client.Close() })
 		cleanup = func() { _ = client.Close() }
 		return deps, cleanup, nil
 	}
 
 	return deps, cleanup, fmt.Errorf("unknown store driver %q", cfg.Store.Driver)
 }
-
-// closeFuncStore is a tiny adapter so we can return a function as a Closer.
-type closeFuncStore func() error
-
-func (f closeFuncStore) Close() error { return f() }
-
-// _ ensures the notify import stays referenced after future refactors.
-var _ = notify.ChannelInApp

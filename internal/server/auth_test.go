@@ -369,20 +369,9 @@ func TestInternalAuthInterceptor(t *testing.T) {
 	})
 }
 
-func TestConstantTimeEqual(t *testing.T) {
-	cases := []struct {
-		a, b string
-		want bool
-	}{
-		{"", "", true},
-		{"abc", "abc", true},
-		{"abc", "abd", false},
-		{"abc", "ab", false},
-		{"a", "ab", false},
-	}
-	for _, tc := range cases {
-		if got := constantTimeEqual(tc.a, tc.b); got != tc.want {
-			t.Errorf("equal(%q,%q) = %v, want %v", tc.a, tc.b, got, tc.want)
-		}
-	}
-}
+// The constant-time comparison used by NewInternalAuthInterceptor is now
+// crypto/subtle.ConstantTimeCompare (standard library) — its behaviour is
+// exercised end-to-end by the surrounding TestInternalAuthInterceptor
+// subtests (match → next is called, mismatch → unauthenticated, missing
+// header → unauthenticated). No standalone unit test for the byte-compare
+// primitive is needed; the stdlib carries that.

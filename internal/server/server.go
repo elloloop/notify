@@ -296,8 +296,10 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-// Addr returns the live client-server listener address, panicking only if Run
-// has not been called yet. Tests use this to compose Connect clients.
+// Addr returns the live client-server listener address, or the empty string
+// when Run has not yet bound it. Tests use this to compose Connect clients
+// after starting the server; a "" return is the sentinel that Run hasn't been
+// reached, never a panic.
 func (s *Server) Addr() string {
 	if s.clientListener == nil {
 		return ""

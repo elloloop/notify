@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"strings"
@@ -243,24 +244,10 @@ func NewInternalAuthInterceptor(expected string, devMode bool) connect.UnaryInte
 			if got == "" {
 				return nil, unauthenticated(errors.New("missing X-Notify-Internal-Token header"))
 			}
-			if !constantTimeEqual(got, expected) {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
 				return nil, unauthenticated(errors.New("internal token mismatch"))
 			}
 			return next(ctx, req)
 		}
 	}
-}
-
-// constantTimeEqual is `subtle.ConstantTimeCompare`-flavoured: avoids early-out
-// on the first differing byte so an attacker cannot time their way to the
-// shared secret. Inlined to avoid an extra import alias purely for one line.
-func constantTimeEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := 0; i < len(a); i++ {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }
