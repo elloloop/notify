@@ -38,13 +38,21 @@ func (p *inAppProvider) Name() string { return "in_app_realtime" }
 // Send delivers the rendered notify.Message to every live connection of the
 // target user via Registry.Push. The send is non-blocking: a backed-up client
 // has its event dropped (Registry logs and counts it) rather than blocking
-// the orchestrator. We always return StatusDelivered: the durable row exists
-// either way, and "delivered to N live connections" is the platform's
-// best-effort semantic for in-app.
+// the orchestrator.
+//
+// Return semantics. The row status reflects whether ANY live connection
+// received the event, not just that the platform "tried":
+//
+//   - 1+ live connections accepted the event → StatusDelivered.
+//   - 0 connections (user is offline) → StatusPending: the row stays available
+//     for later catch-up via GetNotifications. A status of "Delivered" on a
+//     row no live device received would lie to downstream consumers reading
+//     the row's lifecycle later (the unread filter, the read-receipt analytics
+//     in the api gateway, etc.).
 //
 // If the provider has been constructed with a nil registry the call returns
-// an error so the orchestrator records StatusFailed — this should never
-// happen in practice (Server.New rejects it) but is defensive against future
+// an error so the orchestrator records StatusFailed — this should never happen
+// in practice (Server.New rejects it) but is defensive against future
 // refactors.
 func (p *inAppProvider) Send(_ context.Context, msg notify.Message) (notify.Receipt, error) {
 	if p.registry == nil {
@@ -60,9 +68,9 @@ func (p *inAppProvider) Send(_ context.Context, msg notify.Message) (notify.Rece
 			},
 		},
 	}
-	// Push to every live connection for the user. Push returns the count of
-	// accepted connections — we don't act on it: offline users still have
-	// the row stored, so the orchestrator's StatusDelivered is correct.
-	p.registry.Push(msg.To, ev)
+	delivered := p.registry.Push(msg.To, ev)
+	if delivered == 0 {
+		return notify.Receipt{Status: notify.StatusPending}, nil
+	}
 	return notify.Receipt{Status: notify.StatusDelivered}, nil
 }

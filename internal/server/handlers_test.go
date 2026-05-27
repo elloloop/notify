@@ -30,13 +30,20 @@ type fakeStore struct {
 	queryNextCursor  string
 	queryUnreadCount int
 
+	// getResult is returned by GetNotification when the (tenant, user, id)
+	// arguments match. A nil getResult or a mismatching tuple → ErrNotFound.
+	// getErr (when non-nil) overrides everything else and is returned as the
+	// only result of GetNotification — useful for "internal error" paths.
+	getResult *notify.Notification
+	getErr    error
+
 	// Observed calls.
-	created       []*notify.Notification
-	updates       []updateCall
-	queries       []notify.Query
-	upserts       []*notify.Device
-	getCalls      int
-	listDevices   int
+	created     []*notify.Notification
+	updates     []updateCall
+	queries     []notify.Query
+	upserts     []*notify.Device
+	getCalls    []getCall
+	listDevices int
 }
 
 type updateCall struct {
@@ -44,6 +51,12 @@ type updateCall struct {
 	id     string
 	status notify.DeliveryStatus
 	atMS   int64
+}
+
+type getCall struct {
+	tenant string
+	user   string
+	id     string
 }
 
 func (s *fakeStore) CreateNotification(_ context.Context, n *notify.Notification) (bool, error) {
@@ -57,11 +70,20 @@ func (s *fakeStore) CreateNotification(_ context.Context, n *notify.Notification
 	return true, nil
 }
 
-func (s *fakeStore) GetNotification(_ context.Context, _, _, _ string) (*notify.Notification, error) {
+func (s *fakeStore) GetNotification(_ context.Context, tenantID, userID, id string) (*notify.Notification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.getCalls++
-	return nil, notify.ErrNotFound
+	s.getCalls = append(s.getCalls, getCall{tenant: tenantID, user: userID, id: id})
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	if s.getResult == nil {
+		return nil, notify.ErrNotFound
+	}
+	if s.getResult.TenantID != tenantID || s.getResult.UserID != userID || s.getResult.ID != id {
+		return nil, notify.ErrNotFound
+	}
+	return s.getResult, nil
 }
 
 func (s *fakeStore) UpdateStatus(_ context.Context, tenantID, id string, st notify.DeliveryStatus, atMS int64) error {
@@ -290,13 +312,14 @@ func TestClientHandler_GetNotifications_NoClaims(t *testing.T) {
 	}
 }
 
-func TestClientHandler_GetNotifications_CursorRoundTrip(t *testing.T) {
+func TestClientHandler_GetNotifications_CursorDecode(t *testing.T) {
 	fs := &fakeStore{}
 	h := newClientHandler(fs, nil, fixedClock(0))
 	ctx := ctxWithClaims("u", "t")
 
-	cursor := encodeCursor(12345)
-	_, err := h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{Cursor: cursor}))
+	// The wire cursor is the decimal-encoded created-at-ms string the store
+	// itself emits; the handler must pass that through to Query.CursorMS.
+	_, err := h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{Cursor: "12345"}))
 	if err != nil {
 		t.Fatalf("GetNotifications: %v", err)
 	}
@@ -305,10 +328,38 @@ func TestClientHandler_GetNotifications_CursorRoundTrip(t *testing.T) {
 	}
 }
 
+// TestClientHandler_GetNotifications_RealRoundTrip closes the loop the earlier
+// version of this PR silently broke: feed the server's NextCursor back in as
+// the next request's Cursor and assert the handler decodes it. A response that
+// is not consumable by a subsequent request fails this test loudly.
+func TestClientHandler_GetNotifications_RealRoundTrip(t *testing.T) {
+	fs := &fakeStore{queryNextCursor: "1700000000000"}
+	h := newClientHandler(fs, nil, fixedClock(0))
+	ctx := ctxWithClaims("u", "t")
+
+	first, err := h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{}))
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	next := first.Msg.GetNextCursor()
+	if next == "" {
+		t.Fatal("first page emitted empty NextCursor")
+	}
+
+	// Feed it back as the cursor; the handler must accept it without error.
+	_, err = h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{Cursor: next}))
+	if err != nil {
+		t.Fatalf("second page with %q: %v", next, err)
+	}
+	if got := fs.queries[1].CursorMS; got == nil || *got != 1700000000000 {
+		t.Fatalf("second page CursorMS = %v, want 1700000000000", got)
+	}
+}
+
 func TestClientHandler_GetNotifications_BadCursor(t *testing.T) {
 	h := newClientHandler(&fakeStore{}, nil, fixedClock(0))
 	ctx := ctxWithClaims("u", "t")
-	_, err := h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{Cursor: "!!!"}))
+	_, err := h.GetNotifications(ctx, connect.NewRequest(&notifyv1.GetNotificationsRequest{Cursor: "not-an-int"}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -327,13 +378,26 @@ func TestClientHandler_GetNotifications_StoreError(t *testing.T) {
 	}
 }
 
+// ownedNotif is a helper for the AckNotification ownership-check tests — it
+// builds a Notification whose tenant + user line up with the calling claims so
+// the handler's Get-first check passes.
+func ownedNotif(tenant, user, id string) *notify.Notification {
+	return &notify.Notification{ID: id, TenantID: tenant, UserID: user}
+}
+
 func TestClientHandler_AckNotification_HappyPath(t *testing.T) {
-	fs := &fakeStore{}
+	fs := &fakeStore{getResult: ownedNotif("tenant-a", "u", "row-1")}
 	h := newClientHandler(fs, nil, fixedClock(999))
 	ctx := ctxWithClaims("u", "tenant-a")
 	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "row-1"}))
 	if err != nil {
 		t.Fatalf("AckNotification: %v", err)
+	}
+	if len(fs.getCalls) != 1 {
+		t.Fatalf("expected one Get for ownership check, got %d", len(fs.getCalls))
+	}
+	if got := fs.getCalls[0]; got.tenant != "tenant-a" || got.user != "u" || got.id != "row-1" {
+		t.Fatalf("ownership get = %+v", got)
 	}
 	if len(fs.updates) != 1 {
 		t.Fatalf("updates = %v", fs.updates)
@@ -353,18 +417,73 @@ func TestClientHandler_AckNotification_Validation(t *testing.T) {
 	}
 }
 
+// TestClientHandler_AckNotification_NotFound — the row simply doesn't exist.
+// The ownership Get fails first; UpdateStatus is never reached.
 func TestClientHandler_AckNotification_NotFound(t *testing.T) {
-	fs := &fakeStore{updateErr: notify.ErrNotFound}
+	fs := &fakeStore{} // getResult unset → GetNotification always returns ErrNotFound
 	h := newClientHandler(fs, nil, fixedClock(0))
 	ctx := ctxWithClaims("u", "t")
 	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "x"}))
 	if err == nil || connect.CodeOf(err) != connect.CodeNotFound {
 		t.Fatalf("err=%v code=%v", err, connect.CodeOf(err))
 	}
+	if len(fs.updates) != 0 {
+		t.Fatalf("UpdateStatus must NOT be called when ownership check fails: %+v", fs.updates)
+	}
 }
 
+// TestClientHandler_AckNotification_CrossUser — the canonical privacy bug
+// regression test. user "alice" must NOT be able to ack a row owned by "bob"
+// in the same tenant by guessing the id.
+func TestClientHandler_AckNotification_CrossUser(t *testing.T) {
+	fs := &fakeStore{getResult: ownedNotif("tenant-a", "bob", "row-1")}
+	h := newClientHandler(fs, nil, fixedClock(0))
+	ctx := ctxWithClaims("alice", "tenant-a")
+	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "row-1"}))
+	if err == nil || connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("cross-user ack must surface as NotFound, got code=%v err=%v", connect.CodeOf(err), err)
+	}
+	if len(fs.updates) != 0 {
+		t.Fatalf("UpdateStatus must NOT be called for a cross-user ack: %+v", fs.updates)
+	}
+}
+
+// TestClientHandler_AckNotification_CrossTenant — the same row exists in
+// tenant T1 but the caller is in T2; the lookup must miss, never silently
+// transition T1's row.
+func TestClientHandler_AckNotification_CrossTenant(t *testing.T) {
+	fs := &fakeStore{getResult: ownedNotif("tenant-1", "u", "row-1")}
+	h := newClientHandler(fs, nil, fixedClock(0))
+	ctx := ctxWithClaims("u", "tenant-2")
+	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "row-1"}))
+	if err == nil || connect.CodeOf(err) != connect.CodeNotFound {
+		t.Fatalf("cross-tenant ack must surface as NotFound, got code=%v err=%v", connect.CodeOf(err), err)
+	}
+	if len(fs.updates) != 0 {
+		t.Fatalf("UpdateStatus must NOT be called for a cross-tenant ack: %+v", fs.updates)
+	}
+}
+
+// TestClientHandler_AckNotification_LookupInternalError — the ownership Get
+// itself fails (disk, network, …); the handler must return Internal, not
+// NotFound (which would leak "row absent" semantics).
+func TestClientHandler_AckNotification_LookupInternalError(t *testing.T) {
+	fs := &fakeStore{getErr: errors.New("disk")}
+	h := newClientHandler(fs, nil, fixedClock(0))
+	ctx := ctxWithClaims("u", "t")
+	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "x"}))
+	if err == nil || connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("err=%v code=%v", err, connect.CodeOf(err))
+	}
+}
+
+// TestClientHandler_AckNotification_InternalError — the ownership Get
+// succeeds but UpdateStatus fails with a generic error.
 func TestClientHandler_AckNotification_InternalError(t *testing.T) {
-	fs := &fakeStore{updateErr: errors.New("disk")}
+	fs := &fakeStore{
+		getResult: ownedNotif("t", "u", "x"),
+		updateErr: errors.New("disk"),
+	}
 	h := newClientHandler(fs, nil, fixedClock(0))
 	ctx := ctxWithClaims("u", "t")
 	_, err := h.AckNotification(ctx, connect.NewRequest(&notifyv1.AckNotificationRequest{Id: "x"}))
@@ -472,47 +591,37 @@ func TestClientHandler_StreamEvents_DisabledReturnsUnimplemented(t *testing.T) {
 
 // ─── Cursor helpers ─────────────────────────────────────────────────────
 
-func TestCursorRoundTrip(t *testing.T) {
-	cases := []int64{1, 1000, 1700000000000}
-	for _, ms := range cases {
-		c := encodeCursor(ms)
-		if c == "" {
-			t.Fatalf("encode(%d) produced empty", ms)
-		}
-		out, err := decodeCursor(c)
-		if err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if out != ms {
-			t.Fatalf("round-trip: %d -> %q -> %d", ms, c, out)
-		}
+func TestDecodeCursor(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int64
+		err  bool
+	}{
+		{"happy", "1700000000000", 1700000000000, false},
+		{"one", "1", 1, false},
+		{"not_int", "abc", 0, true},
+		{"empty", "", 0, true},
+		{"negative", "-5", 0, true},
+		{"zero", "0", 0, true},
 	}
-}
-
-func TestCursorEdge(t *testing.T) {
-	if got := encodeCursor(0); got != "" {
-		t.Fatalf("encode(0) = %q, want empty", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decodeCursor(tc.in)
+			if tc.err {
+				if err == nil {
+					t.Fatalf("want error, got nil (out=%d)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
 	}
-	if _, err := decodeCursor("not-base64?"); err == nil {
-		t.Fatal("expected error on bad base64")
-	}
-	bad := encodeCursor(1)
-	// Replace the encoded body with non-numeric data.
-	if _, err := decodeCursor("aGVsbG8"); err == nil {
-		t.Fatal("expected parse-int error")
-	}
-	// Negative inside.
-	negCursor := encodeCursorRaw("-5")
-	if _, err := decodeCursor(negCursor); err == nil {
-		t.Fatalf("expected error on non-positive cursor, got nil (cursor=%q)", bad)
-	}
-}
-
-// encodeCursorRaw is a test-only helper that base64-encodes whatever string
-// caller passes — used to feed pathological inputs into decodeCursor without
-// going through encodeCursor (which sanitises).
-func encodeCursorRaw(s string) string {
-	return encodeCursorFor([]byte(s))
 }
 
 // ─── Proto ↔ domain mapping coverage ────────────────────────────────────

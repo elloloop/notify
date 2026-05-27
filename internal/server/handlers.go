@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -166,6 +165,13 @@ func (h *clientHandler) GetNotifications(
 // AckNotification marks one row Read. The store key is the platform's id
 // (Notification.ID), not the producer's idempotency key — handlers never
 // translate between them.
+//
+// Authorization. Store.UpdateStatus is tenant-scoped only (the contract takes
+// no userID), so the handler MUST verify that the calling user owns the row
+// before transitioning its status. Otherwise any user in tenant T could mark
+// any other user's notification in T as Read by guessing the id. The check is
+// a tenant+user+id Get; ErrNotFound covers cross-user, cross-tenant, and
+// unknown-id in one branch — exactly the privacy story callers depend on.
 func (h *clientHandler) AckNotification(
 	ctx context.Context,
 	req *connect.Request[notifyv1.AckNotificationRequest],
@@ -178,8 +184,21 @@ func (h *clientHandler) AckNotification(
 	if id == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("id is required"))
 	}
+
+	// Ownership check: GetNotification scopes to (tenant, user, id). A
+	// mismatch on either tenant or user surfaces as ErrNotFound, mapped to
+	// CodeNotFound on the wire — never CodePermissionDenied, which would
+	// leak the existence of someone else's row.
+	if _, err := h.store.GetNotification(ctx, claims.TenantID, claims.UserID, id); err != nil {
+		if errors.Is(err, notify.ErrNotFound) {
+			return nil, connect.NewError(connect.CodeNotFound, err)
+		}
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("notify: ack lookup: %w", err))
+	}
+
 	if err := h.store.UpdateStatus(ctx, claims.TenantID, id, notify.StatusRead, h.now()); err != nil {
 		if errors.Is(err, notify.ErrNotFound) {
+			// Raced with a delete; treat as not found.
 			return nil, connect.NewError(connect.CodeNotFound, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("notify: ack: %w", err))
@@ -256,28 +275,20 @@ func (h *clientHandler) StreamEvents(
 	return h.stream.serve(ctx, req, stream)
 }
 
-// encodeCursor / decodeCursor wrap the cursor-ms-int with base64 so the wire
-// representation is opaque. Both directions are tiny and easy to test.
-func encodeCursor(ms int64) string {
-	if ms <= 0 {
-		return ""
-	}
-	return encodeCursorFor([]byte(strconv.FormatInt(ms, 10)))
-}
-
-// encodeCursorFor is the raw encode step, factored out so tests can feed
-// pathological payloads (e.g. negative integers, empty strings) into
-// decodeCursor without going through the sanitising encodeCursor path.
-func encodeCursorFor(raw []byte) string {
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
+// decodeCursor parses an inbound cursor string. The wire format is the SAME
+// string the store hands back via QueryUserNotifications: a decimal-encoded
+// created-at-ms boundary. The handler echoes it on NextCursor without
+// transformation, so a client can pass back exactly what it received.
+//
+// The cursor is opaque from the client's POV — they never inspect it — but
+// the platform avoids an extra base64 layer here because (a) it has zero
+// security value (the value is already non-sensitive metadata), (b) keeping
+// the wire format identical to the store's internal cursor makes paging
+// trivially debuggable in production logs, and (c) the earlier double-encode
+// shape silently broke the round-trip (response set raw, request expected
+// base64 → 400 on every second page).
 func decodeCursor(c string) (int64, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(c)
-	if err != nil {
-		return 0, err
-	}
-	ms, err := strconv.ParseInt(string(raw), 10, 64)
+	ms, err := strconv.ParseInt(c, 10, 64)
 	if err != nil {
 		return 0, err
 	}
