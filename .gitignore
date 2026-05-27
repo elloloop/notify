@@ -1,6 +1,8 @@
-# Binaries
+# Binaries — match only the compiled artifacts, not the cmd/notifyd source
+# directory (which `go build ./cmd/notifyd` produces a `/notifyd` binary
+# from at the repo root).
 /bin/
-notifyd
+/notifyd
 *.exe
 
 # Test / coverage output
