@@ -22,10 +22,9 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
     </li>
   </ul>
   <p>
-    Both packaging modes share the same internals — the dual-mode pattern
-    is the same one <a href="https://github.com/elloloop/identity">elloloop/identity</a>
-    and <a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db</a>
-    use.
+    Both packaging modes share the same internals: every type, function and
+    test in the library is the exact code the container runs. Embedding the
+    library is just choosing to skip the network hop.
   </p>
 
   <h2>Design goals</h2>

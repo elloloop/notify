@@ -30,11 +30,13 @@ import { Code } from "astro-expressive-code/components";
 
   <h2>How it deploys</h2>
   <p>
-    One container, three listeners. Treat it like
-    <a href="https://github.com/elloloop/tenant-shard-db">tenant-shard-db</a>
-    or <a href="https://github.com/elloloop/identity">identity</a>: pin a
-    tag, deploy once per environment. Auth is JWT (HS256) against a shared
-    secret — no callback into any consumer.
+    One container, three listeners. The deployment shape is the same as
+    any versioned service image: pull a pinned tag, run one replica per
+    environment, point it at a durable store. The container is stateless
+    above the store, so rolling restarts are safe and zero-downtime upgrades
+    are a single image swap. Auth is JWT (HS256) against a shared secret —
+    the container validates tokens locally and never calls back into the
+    consumer that produced them.
   </p>
 
   <Code code={`docker run --rm \\
@@ -77,9 +79,9 @@ import { Code } from "astro-expressive-code/components";
     <tr><td>Device</td><td><code>notify_devices</code> table</td><td><code>DeviceRegistration</code> node, <code>type_id = 2</code></td></tr>
   </table>
   <p>
-    notify runs its own EntDB instance; <code>type_id</code> values are
-    scoped to that deployment and do not collide with the identity
-    namespace.
+    notify runs its own EntDB instance — the <code>type_id</code> values
+    above are local to that instance, so they co-exist cleanly with any
+    other tenants sharing the EntDB server.
   </p>
 
   <h2>Where to next</h2>

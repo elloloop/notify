@@ -131,9 +131,8 @@ jwt encode --secret "your-shared-hex-secret" --alg HS256 \\
   <h2>What if my JWT is RS256?</h2>
   <p>
     v0.1 only validates HS256. If your identity provider signs RS256
-    (e.g. you are using the
-    <a href="https://github.com/elloloop/identity">identity</a> service's
-    JWKS surface), the recommended shape today is:
+    (any standard OIDC IdP exposing a JWKS endpoint), the recommended
+    shape today is:
   </p>
   <ul>
     <li>Run a thin reverse proxy / gateway in front of notify that verifies the RS256 token against JWKS, then re-mints an HS256 token for notify's downstream consumption.</li>
